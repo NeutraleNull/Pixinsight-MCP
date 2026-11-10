@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-for-pixinsight",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "MCP server that lets an AI assistant work together with you in PixInsight, through PixInsight's documented command-line IPC.",
   "private": true,
   "license": "GPL-3.0-or-later",
