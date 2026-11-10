@@ -53,10 +53,16 @@ function failure(kind: string, message: string, extra: Record<string, unknown> =
 }
 
 /** What an assistant should do about a job that is not finished. */
-function pendingHint(snapshot: JobSnapshot): string {
+function pendingHint(snapshot: JobSnapshot, ahead: JobSnapshot | null): string {
   // Only once the script has gone out: before that, its check can still turn it down.
   if (snapshot.op === 'start_script' && snapshot.state !== 'queued') {
     return 'The script is in PixInsight, where an ordinary script shows a dialog. Tell the user what to set there, and wait. The job ends when the script has, and get_job then reports what changed. Do not start the script again. Other tools wait until it has ended.';
+  }
+  if (snapshot.state === 'queued' && ahead?.op === 'start_script' && ahead.state !== 'queued') {
+    return `This job waits behind a script that is open in PixInsight (job ${ahead.id}), where the user works its dialog. It runs by itself once the script has ended. Do not send it again: check on it with get_job.`;
+  }
+  if (snapshot.state === 'queued' && ahead) {
+    return `This job waits behind an earlier one (${ahead.op}, job ${ahead.id}), and runs by itself after it. Do not send it again: check on it with get_job.`;
   }
   if (snapshot.waitingForInput) {
     return 'PixInsight uses no CPU and writes nothing to its console. A dialog is probably open there: please ask the user to look at it. Do not resend the job: it runs by itself once the dialog is closed. A process that waits for another program or a download can look the same, so read logTail. Only if PixInsight has crashed or no longer reacts at all, free the queue with cancel_job and abandon: true.';
@@ -64,8 +70,12 @@ function pendingHint(snapshot: JobSnapshot): string {
   return 'The job is still in progress. Check on it with get_job.';
 }
 
-/** Turns a job into a tool result. An unfinished job is not an error, just something to check on. */
-async function render(snapshot: JobSnapshot): Promise<CallToolResult> {
+/**
+ * Turns a job into a tool result. An unfinished job is not an error, just something to check on.
+ *
+ * @param ahead The job PixInsight is busy with, if it is another one than this.
+ */
+async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null): Promise<CallToolResult> {
   if (!snapshot.done) {
     return text({
       pending: true,
@@ -74,7 +84,7 @@ async function render(snapshot: JobSnapshot): Promise<CallToolResult> {
       activity: snapshot.activity,
       waitingForInput: snapshot.waitingForInput,
       ...(snapshot.logTail ? { logTail: snapshot.logTail } : {}),
-      hint: pendingHint(snapshot),
+      hint: pendingHint(snapshot, ahead),
     });
   }
   // A process can report success and still have done nothing, and many results only exist in its log.
@@ -149,7 +159,8 @@ async function awaitJob(session: Session, ctx: ServerContext, id: string, wait: 
         },
     ctx.mcpReq.signal,
   );
-  return render(snapshot);
+  const active = session.jobs.stats().active;
+  return render(snapshot, active && active.id !== snapshot.id ? active : null);
 }
 
 /** What applies to every session, whatever the task. */

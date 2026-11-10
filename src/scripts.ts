@@ -160,18 +160,67 @@ async function scriptFiles(dir: string, limits: ScanLimits, depth = 0, found: st
 }
 
 /**
- * The featured scripts in these folders, by name. A name that comes up again is left out, so that a
- * script in a later folder cannot take the place of one that PixInsight ships.
+ * The name a script goes by. Two scripts of one origin can carry the same name and differ in their
+ * menu item only, as two that PixInsight ships do. The second one then goes by its menu item. A
+ * name that a script of another origin has is never given away: a script in a folder of the user
+ * must not take the place of one that PixInsight ships.
+ */
+function nameFor(feature: Pick<ScriptInfo, 'name' | 'menus'>, source: ScriptInfo['source'], taken: ReadonlyMap<string, ScriptInfo>): string | null {
+  const holder = taken.get(feature.name.toLowerCase());
+  if (!holder) return feature.name;
+  const menuItem = feature.menus[0]?.split(' > ').at(-1) ?? '';
+  const free = menuItem !== '' && menuItem.length <= MAX_NAME_LENGTH && !taken.has(menuItem.toLowerCase());
+  return holder.source === source && free ? menuItem : null;
+}
+
+/**
+ * The featured scripts in these folders, by name. A script whose name is taken, and that cannot
+ * go by its menu item instead, is left out.
  */
 export async function findScripts(folders: readonly ScriptFolder[], limits: ScanLimits = DEFAULT_LIMITS): Promise<ScriptInfo[]> {
   const byName = new Map<string, ScriptInfo>();
   for (const { dir, source } of folders) {
     for (const path of await scriptFiles(dir, limits)) {
       const feature = parseFeature(await readHead(path).catch(() => ''));
-      if (!feature || byName.has(feature.name.toLowerCase())) continue;
+      const name = feature && nameFor(feature, source, byName);
+      if (!feature || !name) continue;
       const sha256 = await hashOfFile(path).catch(() => null);
-      if (sha256) byName.set(feature.name.toLowerCase(), { ...feature, path, source, sha256 });
+      if (sha256) byName.set(name.toLowerCase(), { ...feature, name, path, source, sha256 });
     }
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** How many single letters have to be added, removed or replaced to turn one text into the other. */
+function editDistance(a: string, b: string): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min((previous[j] as number) + 1, (current[j - 1] as number) + 1, (previous[j - 1] as number) + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[b.length] as number;
+}
+
+/**
+ * The names someone most likely meant with a name that does not exist: those that contain it or
+ * are contained in it, and those that differ by a slip of the keyboard. Closest first.
+ */
+export function similarNames(wanted: string, names: readonly string[], limit = 5): string[] {
+  const target = wanted.trim().toLowerCase();
+  if (!target) return [];
+  const scored = names.flatMap((name) => {
+    const candidate = name.toLowerCase();
+    const distance = editDistance(target, candidate);
+    const partOf = candidate.includes(target) || target.includes(candidate);
+    // A third of the letters wrong is no slip any more. A name that holds what was typed counts
+    // like one slip, however much longer it is.
+    return partOf || distance <= Math.max(1, Math.floor(target.length / 3)) ? [{ name, score: partOf ? Math.min(distance, 1) : distance }] : [];
+  });
+  return scored
+    .sort((a, b) => a.score - b.score || a.name.localeCompare(b.name))
+    .slice(0, limit)
+    .map((entry) => entry.name);
 }

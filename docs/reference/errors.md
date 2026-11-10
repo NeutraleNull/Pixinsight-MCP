@@ -44,7 +44,7 @@ When a tool fails, its result has `isError` set and contains a JSON object with 
 | `unknown_view` | No open image or preview has this ID. | Look it up with [`list_images`](tools.md#list_images). Previews use the full ID, `image->preview`. |
 | `invalid_region` | The region does not overlap the image. | Check the coordinates against the image size. |
 | `invalid_mask` | The mask is a preview, has other dimensions than the image, is the image itself, or the process cannot run through a mask. | Use a main view of the same size. |
-| `unknown_script` | No script of the Script menu has this name. The message names similar ones. | Look it up with [`list_scripts`](tools.md#list_scripts). A script in a folder of your own needs [`PIXINSIGHT_MCP_SCRIPT_DIRS`](configuration.md). |
+| `unknown_script` | No script of the Script menu has this name. The message names similar ones, also for a misspelled name. | Look it up with [`list_scripts`](tools.md#list_scripts). A script in a folder of your own needs [`PIXINSIGHT_MCP_SCRIPT_DIRS`](configuration.md). |
 | `blocked_script` | The script is in a menu the assistant must not start from, or the path of its file has a character that PixInsight's command line does not take. | See [Scripts the assistant cannot start](../guides/run-scripts-and-code.md#scripts-the-assistant-cannot-start). Start it yourself from the Script menu. |
 | `script_changed` | The file of the script has changed since the server started, or since it listed the script. It was not started, because a changed file could hold anything. | If the change is yours, restart the server. |
 | `script_open` | `start_script` was called while another script is still open or waiting. | Finish or close the open script first. The message names its job. |

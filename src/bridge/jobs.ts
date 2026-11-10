@@ -162,7 +162,11 @@ const JOB_LOG = 'console.log';
 const SCRIPT_LOG = 'script.log';
 const CPU_BUSY_CORES = 0.05;
 const LOG_TAIL_LINES = 8;
+/** A long log is shown by its start, which says what ran on what, and its end, which holds the outcome. */
 const LOG_LINES = 30;
+const LOG_HEAD_LINES = 6;
+/** For the start of a log that is longer than what is read of its end. */
+const LOG_START_BYTES = 16 * 1024;
 /** A script can write for hours, so only the end of a log is ever read. */
 const LOG_TAIL_BYTES = 64 * 1024;
 const LOG_END_BYTES = 1024 * 1024;
@@ -207,17 +211,53 @@ async function readEnd(path: string, maxBytes: number): Promise<string> {
   }
 }
 
+/** The start of a text file, up to its last whole line. Empty if the file is not there. */
+async function readStart(path: string, maxBytes: number): Promise<string> {
+  const file = await open(path, 'r').catch(() => null);
+  if (!file) return '';
+  try {
+    const { buffer, bytesRead } = await file.read(Buffer.alloc(maxBytes), 0, maxBytes, 0);
+    const text = buffer.toString('utf8', 0, bytesRead);
+    return bytesRead < maxBytes ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+  } catch {
+    return '';
+  } finally {
+    await file.close();
+  }
+}
+
 function isJobResult(value: unknown): value is JobResult {
   return typeof value === 'object' && value !== null && typeof (value as JobResult).ok === 'boolean';
 }
 
 /** Console text without timestamps, color codes and the lines that only report progress. */
 function cleanLog(text: string): string[] {
-  return text
+  const lines = text
     .split(/\r?\n|\r/)
     .map((line) => line.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\[[^\]]*\]\s?/, '').trim())
-    .filter((line) => line.length > 0 && !LOG_NOISE.test(line))
-    .map((line) => line.substring(0, MAX_LINE_LENGTH));
+    .filter((line) => line.length > 0 && !LOG_NOISE.test(line));
+  // PixInsight notes for every signed script who signed it and when, which is not part of its output.
+  const kept: string[] = [];
+  let inSignature = false;
+  for (const line of lines) {
+    if (/^\* Code signature verified:?$/.test(line)) inSignature = true;
+    else if (inSignature && /^(script-id|developer-id|timestamp)\s*:/.test(line)) continue;
+    else {
+      inSignature = false;
+      kept.push(line.substring(0, MAX_LINE_LENGTH));
+    }
+  }
+  return kept;
+}
+
+/** The lines to show of a finished log: all of a short one, the start and the end of a long one. */
+function summarizeLog(lines: string[], start: string[] | null): string[] {
+  // `start` is given if only the end of the file was read, so that nobody knows how much lies between.
+  if (!start && lines.length <= LOG_LINES) return lines;
+  const head = (start ?? lines).slice(0, LOG_HEAD_LINES);
+  const tail = lines.slice(-(LOG_LINES - LOG_HEAD_LINES - 1));
+  const between = start ? 'many' : String(lines.length - head.length - tail.length);
+  return [...head, `… ${between} lines left out …`, ...tail];
 }
 
 /**
@@ -632,13 +672,16 @@ export class JobManager {
       return;
     }
     if (Array.isArray(result.images)) this.remember(result.images);
-    const lines = cleanLog(await readEnd(join(job.dir, job.logName), LOG_END_BYTES));
+    const logPath = join(job.dir, job.logName);
+    const lines = cleanLog(await readEnd(logPath, LOG_END_BYTES));
+    const whole = ((await stat(logPath).catch(() => null))?.size ?? 0) <= LOG_END_BYTES;
+    const start = whole ? null : cleanLog(await readStart(logPath, LOG_START_BYTES));
     const state: JobState = result.ok ? 'succeeded' : result.error?.kind === 'aborted' ? 'aborted' : 'failed';
     this.finish(job, state, {
       value: result.value,
       error: result.error,
       console: lines.filter(isProblem).slice(-PROBLEM_LINES),
-      log: lines.slice(-LOG_LINES),
+      log: summarizeLog(lines, start),
     });
   }
 

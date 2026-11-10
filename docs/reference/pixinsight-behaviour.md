@@ -109,6 +109,10 @@ Measured in a windowless instance in automation mode.
 | `console.beginLog( path )` in one script | Stays on for the scripts that follow, in either engine, until a script calls `endLog()` or `beginLog()` again. It replaces the file, and a second call starts over |
 | `coreSrcDirPath` | The `src` folder of the installation, with the scripts in `scripts`: 315 `.js` files of 10 MB here, 116 of them featured, none deeper than two folders, and each `#feature-id` within the first 16 KB |
 | Forms of the `#feature-id` directive | `Name : Menu > Item \| Menu > Item`, or only `Menu > Item` in 13 older scripts. Directives can continue on the next line after a backslash |
+| Two featured scripts with one name | `NoiseEvaluation` exists twice in this installation, with the menu items `NoiseEvaluation` and `NoiseEvaluation (CFA Bayer)`. So the name alone does not identify a script |
+| A signed script | PixInsight writes four lines to the console before the script runs: that the signature was verified, the script, the developer and the time of signing |
+| A script that shows its result in its dialog only | FWHMEccentricity writes the number of stars to the console, but its measurements appear only in the dialog, so no program can read them |
+| ImageSolver on a crop whose keywords give the center of the whole image | Several error lines about the initial alignment, then it solves blindly and succeeds. The step is in the history, and undo takes the solution away again |
 | `view.beginProcess( UndoFlag.NoSwapFile )` | Changes pixels with no step in the history, and `historyIndex` stays |
 | Assigning `window.keywords` | Changes the metadata with no step in the history |
 

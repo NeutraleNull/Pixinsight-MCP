@@ -428,6 +428,8 @@ describe('Session', () => {
 
     it('names scripts that are meant, and never one from a folder that only shares the name', async () => {
       expect((await start({ script: 'Solv' }, own)).error?.message).toMatch(/Did you mean Solver\?/);
+      expect((await start({ script: 'Sovler' }, own)).error?.message).toMatch(/Did you mean Solver\?/);
+      expect((await start({ script: 'Something else entirely' }, own)).error?.message).toBe('No script named Something else entirely. Use list_scripts.');
       await start({ script: 'Solver' }, own);
       expect(cli.started).toEqual([{ slot: USER, path: join(shipped, 'Solver.js') }]);
     });

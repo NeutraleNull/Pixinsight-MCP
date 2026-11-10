@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { findScripts, hashOfFile, parseFeature } from '../../src/scripts.js';
+import { findScripts, hashOfFile, parseFeature, similarNames } from '../../src/scripts.js';
 
 describe('parseFeature', () => {
   it('reads a name with its menu', () => {
@@ -138,9 +138,55 @@ describe('findScripts', () => {
     expect(await names(user('a'))).toEqual(['Inside']);
   });
 
-  it('takes the first of two files in one folder that claim the same name, in the order of their file names', async () => {
-    await write('a/b.js', '#feature-id Same : Utilities > Second\n');
-    await write('a/a.js', '#feature-id Same : Utilities > First\n');
-    expect((await findScripts([shipped('a')])).map((script) => script.menus)).toEqual([['Utilities > First']]);
+  it('lets the second of two scripts with one name go by its menu item, as two that PixInsight ships need', async () => {
+    await write('a/Noise.js', '#feature-id Noise : Image Analysis > Noise\n');
+    await write('a/NoiseCFA.js', '#feature-id Noise : Image Analysis > Noise (CFA Bayer)\n');
+    expect((await findScripts([shipped('a')])).map((script) => [script.name, script.path])).toEqual([
+      ['Noise', join(root, 'a', 'Noise.js')],
+      ['Noise (CFA Bayer)', join(root, 'a', 'NoiseCFA.js')],
+    ]);
+  });
+
+  it('leaves out a script whose name and menu item are both taken', async () => {
+    await write('a/a.js', '#feature-id Same : Utilities > Same\n');
+    await write('a/b.js', '#feature-id Same : Render > Same\n');
+    await write('a/c.js', '#feature-id Other : Utilities > Other\n');
+    await write('a/d.js', '#feature-id Same : Utilities > Other\n');
+    expect((await findScripts([shipped('a')])).map((script) => [script.name, script.menus[0]])).toEqual([
+      ['Other', 'Utilities > Other'],
+      ['Same', 'Utilities > Same'],
+    ]);
+  });
+
+  it('gives a script of the user no other name either, if PixInsight ships one with its name', async () => {
+    await write('shipped/Solver.js', '#feature-id Solver : Astrometry > Solver\n');
+    await write('mine/x.js', '#feature-id Solver : Utilities > My Solver\n');
+    expect(await names(shipped('shipped'), user('mine'))).toEqual(['Solver']);
+  });
+});
+
+describe('similarNames', () => {
+  const all = ['ImageSolver', 'ImageInsert', 'StarStretch', 'StatisticalStretch', 'StretchAndCombineRGBStars', 'AnnotateImage', 'FSDither'];
+
+  it('finds the name behind a slip of the keyboard', () => {
+    expect(similarNames('ImageSolvr', all)).toEqual(['ImageSolver']);
+    expect(similarNames('imagesolver ', all)).toEqual(['ImageSolver']);
+    expect(similarNames('AnotateImage', all)).toEqual(['AnnotateImage']);
+  });
+
+  it('finds the names that a part belongs to, and the name inside a longer text', () => {
+    expect(similarNames('Stretch', all)).toEqual(['StarStretch', 'StatisticalStretch', 'StretchAndCombineRGBStars']);
+    expect(similarNames('the ImageSolver script', all)).toEqual(['ImageSolver']);
+  });
+
+  it('puts the closest first, and stops at its limit', () => {
+    expect(similarNames('ImageSolve', ['ImageSolved', 'ImageSolver', 'xImageSolveyz'])).toEqual(['ImageSolved', 'ImageSolver', 'xImageSolveyz']);
+    expect(similarNames('Stretch', all, 2)).toEqual(['StarStretch', 'StatisticalStretch']);
+  });
+
+  it('suggests nothing for a name that is far from all of them, or empty', () => {
+    expect(similarNames('WeightedBatch', all)).toEqual([]);
+    expect(similarNames('FS', ['FSDither', 'Fx'])).toEqual(['FSDither', 'Fx']);
+    expect(similarNames('  ', all)).toEqual([]);
   });
 });

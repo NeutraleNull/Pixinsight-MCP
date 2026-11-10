@@ -9,7 +9,7 @@ import type { Installation } from './guides.js';
 import { prepareHome, type HomePaths } from './home.js';
 import { assertSafeForIpc } from './platform.js';
 import { blockReason, parameterRefusal, scriptBlockReason } from './policy.js';
-import { findScripts, hashOfFile, type ScriptFolder, type ScriptInfo } from './scripts.js';
+import { findScripts, hashOfFile, similarNames, type ScriptFolder, type ScriptInfo } from './scripts.js';
 
 export interface ParameterInfo {
   id: string;
@@ -317,8 +317,8 @@ export class Session {
     const wanted = name.trim().toLowerCase();
     const found = scripts.find((script) => script.name.toLowerCase() === wanted);
     if (!found) {
-      const similar = scripts.filter((script) => script.name.toLowerCase().includes(wanted) || wanted.includes(script.name.toLowerCase())).map((script) => script.name);
-      throw new Refusal('unknown_script', `No script named ${name}.${similar.length ? ` Did you mean ${similar.slice(0, 5).join(', ')}?` : ''} Use list_scripts.`);
+      const similar = similarNames(name, scripts.map((script) => script.name));
+      throw new Refusal('unknown_script', `No script named ${name}.${similar.length ? ` Did you mean ${similar.join(', ')}?` : ''} Use list_scripts.`);
     }
     const blocked = scriptBlockReason(found.menus);
     if (blocked) throw new Refusal('blocked_script', `${found.name} cannot be started through this tool: ${blocked}.`);

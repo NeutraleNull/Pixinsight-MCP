@@ -161,6 +161,14 @@ dialog.execute();
       sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(solver?.source).toBe('shipped');
+
+    // Two scripts that PixInsight ships carry one name, and differ in their menu item only.
+    const twin = join(ping.scriptsDir, 'NoiseEvaluation', 'NoiseEvaluationCFA.js');
+    if (existsSync(twin)) {
+      expect(scripts.find((script) => script.path === twin)?.name).toBe('NoiseEvaluation (CFA Bayer)');
+      expect(scripts.find((script) => script.name === 'NoiseEvaluation')?.path).toBe(join(ping.scriptsDir, 'NoiseEvaluation', 'NoiseEvaluation.js'));
+    }
+    expect(new Set(scripts.map((script) => script.name.toLowerCase())).size).toBe(scripts.length);
   });
 
   it('runs a script on the image it was started on, and reports what the script did and wrote', async () => {
@@ -182,6 +190,14 @@ dialog.execute();
     // The step is in the history, so the assistant can take it back.
     await run(session, 'undo', { view: 'mcp_script_a', count: report.changedViews[0]!.steps, historyIndex: report.changedViews[0]!.historyIndex });
     expect(await median(session, 'mcp_script_a')).toBeCloseTo(before, 4);
+  });
+
+  it('runs a script that PixInsight ships, and keeps the note about its signature out of the log', async () => {
+    const done = await start('NoiseEvaluation', 'mcp_script_a');
+    expect(done.state).toBe('succeeded');
+    expect(done.log?.length).toBeGreaterThan(0);
+    expect(done.log?.join('\n')).not.toMatch(/Code signature verified|^developer-id|^script-id/m);
+    expect((done.value as Report).changedViews).toEqual([]);
   });
 
   it('says so when a script changed pixels with no step in the history', async () => {

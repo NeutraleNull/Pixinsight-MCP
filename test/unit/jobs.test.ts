@@ -154,6 +154,38 @@ describe('JobManager', () => {
     expect(cli.sent).toEqual(['a', 'b', 'c']);
   });
 
+  describe('the log of a finished job', () => {
+    const logOf = async (content: string) => {
+      cli.behaviour = async (jobDir) => {
+        await writeFile(join(jobDir, 'started.json'), '{}');
+        await writeFile(join(jobDir, 'console.log'), content);
+        await writeResult(jobDir, JSON.stringify({ ok: true, value: 1 }));
+      };
+      const jobs = manager();
+      return (await jobs.wait(jobs.submit('run_process', {}).id, 2000)).log ?? [];
+    };
+    const numbered = (count: number) => Array.from({ length: count }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
+
+    it('is whole if it is short', async () => {
+      expect(await logOf(numbered(30))).toHaveLength(30);
+    });
+
+    it('shows the start and the end of a long one, and says how much lies between', async () => {
+      const log = await logOf(numbered(100));
+      expect(log).toHaveLength(30);
+      expect(log.slice(0, 7)).toEqual(['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6', '… 71 lines left out …']);
+      expect(log.slice(-2)).toEqual(['line 99', 'line 100']);
+    });
+
+    it('still shows the start of one that is too long to read whole', async () => {
+      const log = await logOf(`the first line\n${'a line in the middle of a very long log\n'.repeat(40_000)}the last line\n`);
+      expect(log).toHaveLength(30);
+      expect(log[0]).toBe('the first line');
+      expect(log[6]).toBe('… many lines left out …');
+      expect(log.at(-1)).toBe('the last line');
+    });
+  });
+
   it('keeps structured errors from the runner, and reads problems from the console log', async () => {
     cli.behaviour = async (jobDir) => {
       await writeFile(join(jobDir, 'console.log'), 'PixelMath: Processing\n*** Error: x\n');
@@ -777,6 +809,22 @@ describe('JobManager', () => {
 
       await finish();
       expect(await jobs.wait(job.id, 2000)).toMatchObject({ state: 'succeeded', log: ['Solving the image', '*** Error: no stars'], console: ['*** Error: no stars'] });
+    });
+
+    it('leaves out what PixInsight notes about the signature of a script', async () => {
+      let finish!: () => Promise<void>;
+      cli.behaviour = (jobDir) => {
+        finish = () => writeResult(jobDir, JSON.stringify({ ok: true, value: {} }));
+      };
+      const jobs = manager();
+      const job = jobs.submit('start_script', {}, ahead());
+      await waitUntil(() => cli.commands.length === 3);
+      await writeFile(
+        join(jobsDir, job.id, 'script.log'),
+        '* Code signature verified:\nscript-id    : Solver\ndeveloper-id : PTeam\ntimestamp    : 2026-10-29T09:36:21.337Z\nSolving\ntimestamp    : a line of the script itself\n',
+      );
+      await finish();
+      expect((await jobs.wait(job.id, 2000)).log).toEqual(['Solving', 'timestamp    : a line of the script itself']);
     });
 
     it('reads only the end of a log that a script has written for hours', async () => {

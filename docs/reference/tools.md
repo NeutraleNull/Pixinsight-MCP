@@ -169,7 +169,7 @@ Runs a process on a view, or globally. A change to an image goes into its histor
 | `hint` | Present if nothing changed and there is no new image, because the process may have done nothing. |
 | `warning` | Present if the mask of the image could not be restored afterwards. |
 | `stats` | Statistics of the target afterwards, one entry per channel. Only for runs on a view. |
-| `log` | The last 30 lines of the output of the process, often the only place for computed results. |
+| `log` | The output of the process, often the only place for computed results. Of an output with more than 30 lines, the first 6 and the last 23, with a line between them that says how many were left out. |
 | `console` | Lines of the log that look like errors or warnings. |
 
 The job takes its place in the queue right away, and the server checks it when its turn comes. So a job sent right after this one runs after it, however long the check takes. A refused job ends with an [error](errors.md#requests). If the check takes longer than `waitMs`, the response is a [pending job](#pending-jobs).
@@ -512,7 +512,7 @@ Lists the scripts of the Script menu that [`start_script`](#start_script) can st
 
 | Field | Description |
 |---|---|
-| `name` | The name to pass to `start_script`. |
+| `name` | The name to pass to `start_script`. If two scripts carry the same name, the second one goes by its menu item, such as `NoiseEvaluation (CFA Bayer)`. |
 | `menus` | Where the script sits in the Script menu. A script can sit in several places. |
 | `info` | What the script says about itself, as plain text, shortened to 240 characters. |
 | `source` | `shipped` for a script of the installation, `user` for one from a folder of yours. |
@@ -583,10 +583,10 @@ Starts a script of the Script menu in your PixInsight. An ordinary script opens 
 | `changedViews[].steps` | How many steps the script added to the history. Pass it as `count` to [`undo`](#undo), with `historyIndex`, to take them back. |
 | `changedViews[].note` | Present with `pixels`: the pixels differ while the history is at the same place. Usually that is a change with no step in the history, which undo cannot take back. The server compares 128 positions per channel, so a small local change can go unnoticed. |
 | `startedOn`, `activeAfter` | The active image when the script started, and afterwards. |
-| `log` | What the script wrote to the console. Only the end of a long output. |
+| `log` | What the script wrote to the console, shortened like the `log` of [`run_process`](#run_process). What PixInsight notes about the signature of a script is left out. |
 | `hint` | Present if nothing is different, which is also what a cancelled dialog looks like. |
 
-While the script is open, every other tool waits, and a second `start_script` is refused with [`script_open`](errors.md#requests). To give up on a script, close its dialog in PixInsight.
+While the script is open, every other tool waits, and its pending response says that a script is open. A second `start_script` is refused with [`script_open`](errors.md#requests). To give up on a script, close its dialog in PixInsight.
 
 What a script does to files or to settings of PixInsight does not show in the report.
 
@@ -617,7 +617,7 @@ Runs JavaScript that the assistant wrote, inside PixInsight, with its scripting 
 |---|---|
 | `value` | What the code returned, or `null`. Big integers come as strings, typed arrays as arrays, and `NaN` and infinite numbers as `null`. |
 | `newViews`, `closedViews`, `changedViews` | What the code did to the open images, as for [`start_script`](#start_script). |
-| `log` | What the code wrote to the console. |
+| `log` | What the code wrote to the console, shortened like the `log` of [`run_process`](#run_process). |
 
 Code that fails ends with [`code_error`](errors.md#processes):
 

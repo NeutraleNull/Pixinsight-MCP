@@ -263,10 +263,20 @@ describe('the tools, as a client sees them', () => {
       session.jobs.submit('stuck', {});
       await waitUntil(() => cli.ran.some((job) => job.op === 'stuck'));
       const [pending] = blocks(await call('start_script', { script: 'Solver', waitMs: 100 }));
-      expect(pending).toMatchObject({ pending: true, state: 'queued', hint: 'The job is still in progress. Check on it with get_job.' });
+      expect(pending).toMatchObject({ pending: true, state: 'queued', hint: expect.stringMatching(/waits behind an earlier one \(stuck, job [0-9a-f-]+\).*Do not send it again/) });
       // Not sent, so it can still be taken back.
       expect(blocks(await call('cancel_job', { jobId: pending.jobId }))[0]).toEqual({ cancelled: true });
       expect(cli.started).toEqual([]);
+    });
+
+    it('tells a job that waits behind an open script why it waits', async () => {
+      cli.script = installation(undefined);
+      const [script] = blocks(await call('start_script', { script: 'Solver', waitMs: 100 }));
+      await waitUntil(() => cli.started.length === 1, 5000);
+      await waitUntil(async () => (await session.jobs.get(script.jobId))?.state !== 'queued', 5000);
+      const [waiting] = blocks(await call('get_image_stats', { view: 'a', waitMs: 100 }));
+      expect(waiting).toMatchObject({ pending: true, state: 'queued' });
+      expect(waiting.hint).toMatch(new RegExp(`waits behind a script that is open in PixInsight \\(job ${script.jobId}\\).*runs by itself once the script has ended`));
     });
 
     it('starts no second script while one is open', async () => {
