@@ -153,7 +153,7 @@ describe('runs of WBPP in an instance of their own', () => {
     expect(run).toMatchObject({ op: 'preprocess', state: 'running', done: false, slot: 240 });
     expect(started().slot).toBe(240);
     expect(started().scripts).toEqual([
-      { path: '/scripts/begin_log.js', args: [join(home, 'jobs', run.id, 'console.log')] },
+      { path: '/scripts/begin_log.js', args: [pix(join(home, 'jobs', run.id, 'console.log'))] },
       { path: '/opt/PixInsight/src/scripts/BatchPreprocessing/WBPP.js', args: ['automationMode=true', `outputDirectory=${out}`, 'keywords=SESSION', `dir=${join(home, 'frames')}`] },
       { path: '/scripts/end_log.js', args: [] },
     ]);

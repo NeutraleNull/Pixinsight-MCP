@@ -555,10 +555,11 @@ describe('the tools, as a client sees them', () => {
           await new Promise<void>((resolve) => (end = resolve));
         });
         let [pending] = blocks(await use('start_script', { script: 'Solver', waitMs: 100 }));
-        // On a slow machine the script is not in PixInsight yet, and the answer says that its job still waits.
+        // On a slow machine the script is not in PixInsight yet, and the answer says that its job waits or is in progress.
+        const atWork = /shows no dialog of its own right now/;
         await waitUntil(async () => {
-          if (/waits behind/.test(String(pending!.hint))) [pending] = blocks(await use('get_job', { jobId: pending!.jobId, waitMs: 100 }));
-          return !/waits behind/.test(String(pending!.hint));
+          if (!atWork.test(String(pending!.hint))) [pending] = blocks(await use('get_job', { jobId: pending!.jobId, waitMs: 100 }));
+          return atWork.test(String(pending!.hint));
         }, 10_000);
         expect(pending).toMatchObject({ pending: true, jobId: expect.any(String), hint: expect.stringMatching(/shows no dialog of its own right now.*get_script_dialog/) });
         expect(pending.dialog).toBeUndefined();
