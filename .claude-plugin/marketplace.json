@@ -1,0 +1,14 @@
+{
+  "name": "pixinsight-mcp",
+  "description": "The MCP server for PixInsight, as a Claude Code plugin.",
+  "owner": {
+    "name": "PixInsight MCP contributors"
+  },
+  "plugins": [
+    {
+      "name": "pixinsight",
+      "source": "./",
+      "description": "The MCP server for PixInsight, with its processing library of workflows and methods from real runs."
+    }
+  ]
+}

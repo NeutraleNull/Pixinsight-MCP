@@ -1,0 +1,50 @@
+{
+  "name": "mcp-server-for-pixinsight",
+  "version": "0.1.0-beta.1",
+  "description": "MCP server that lets an AI assistant work together with you in PixInsight, through PixInsight's documented command-line IPC.",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NeutraleNull/Pixinsight-MCP.git"
+  },
+  "homepage": "https://github.com/NeutraleNull/Pixinsight-MCP#readme",
+  "bugs": "https://github.com/NeutraleNull/Pixinsight-MCP/issues",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "mcp-server-for-pixinsight": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "pjsr",
+    "processing",
+    "skills",
+    ".claude-plugin",
+    ".mcp.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --dir test/unit",
+    "guides:check": "tsc -p tsconfig.build.json && node scripts/check-guides.mjs",
+    "test:live": "tsc -p tsconfig.build.json && vitest run --dir test/live --no-file-parallelism",
+    "start": "node dist/index.js",
+    "prepack": "npm run build",
+    "version": "node scripts/sync-version.mjs && git add .claude-plugin/plugin.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "pixinsight",
+  "description": "Work with an AI assistant in your own PixInsight: the MCP server with its processing library of workflows and methods from real runs.",
+  "version": "0.1.0-beta.1",
+  "author": {
+    "name": "PixInsight MCP contributors"
+  },
+  "license": "GPL-3.0-or-later",
+  "mcpServers": {
+    "pixinsight": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/dist/index.js"
+      ]
+    }
+  }
+}

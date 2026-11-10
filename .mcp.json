@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pixinsight": {
+      "command": "node",
+      "args": [
+        "dist/index.js"
+      ]
+    }
+  }
+}

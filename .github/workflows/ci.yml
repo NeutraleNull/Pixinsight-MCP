@@ -1,0 +1,61 @@
+name: CI
+
+# Everything here runs without PixInsight: its license cannot go into public CI.
+# The tests against a real PixInsight are `npm run test:live`, on a developer's machine.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}, Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A failure on one system says nothing about the others, so let them all finish.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Many of these tests are about timing, and a shared runner stalls now and then. A test that
+      # fails gets two more tries before it counts, and the report still names it as flaky.
+      - run: npm test -- --retry=2
+      - name: Build, and check the processing library
+        run: npm run guides:check
+      - name: Start the built server and talk to it
+        run: node scripts/check-start.mjs
+
+  oldest-node:
+    # The test tools need a newer Node.js than the server does, so the server is built with a
+    # current one and then started with the oldest one it promises to run on.
+    name: Start on Node 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - run: node scripts/check-start.mjs
