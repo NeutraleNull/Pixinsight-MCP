@@ -390,8 +390,10 @@ describe('Session', () => {
       expect(cli.commands).toEqual(['runner.js', 'runner.js', 'begin_log.js', 'Solver.js', 'runner.js']);
       expect(runOps()).toEqual(['prepare_script', 'start_script']);
       // With the file, whose signature PixInsight checks before the script may start.
-      expect(cli.ran.find((job) => job.op === 'prepare_script')?.args).toEqual({ view: 'Ha', script: join(shipped, 'Solver.js') });
-      expect(cli.started).toEqual([{ slot: USER, path: join(shipped, 'Solver.js') }]);
+      // Paths reach PixInsight with forward slashes on every system, so they are compared that way.
+      const prepared = cli.ran.find((job) => job.op === 'prepare_script')?.args;
+      expect({ ...prepared, script: pix(String(prepared?.['script'])) }).toEqual({ view: 'Ha', script: pix(join(shipped, 'Solver.js')) });
+      expect(cli.started.map(({ slot, path }) => ({ slot, path: pix(path) }))).toEqual([{ slot: USER, path: pix(join(shipped, 'Solver.js')) }]);
       // The image comes to the front once more right before the script, in case the user clicked elsewhere.
       expect(cli.logs).toEqual([{ file: join(home, 'jobs', done.id, 'script.log'), view: 'Ha' }]);
       // The report compares with what the images were like before the script.
@@ -713,7 +715,7 @@ describe('Session', () => {
         const source = await readFile(wrapper, 'utf8');
         expect(source.startsWith('( //')).toBe(true);
         // With the folder of the job, leave to work the dialogs, and the engine, which the hook cannot tell by itself.
-        expect(source).toContain(`)( ${JSON.stringify(join(home, 'jobs', done.id))}, true, false );\n#include "${join(shipped, 'Solver.js')}"\n`);
+        expect(source).toContain(`)( ${JSON.stringify(pix(join(home, 'jobs', done.id)))}, true, false );\n#include "${pix(join(shipped, 'Solver.js'))}"\n`);
         // The hook is the one this server came with.
         expect(source).toContain((await readFile(working.paths.dialogHookPath, 'utf8')).trimEnd());
       });
@@ -843,7 +845,8 @@ describe('Session', () => {
         expect(await answer(home)).toMatchObject({ kind: 'question', question: { multiple: true } });
         expect(await answer([existing, existing])).toMatchObject({ kind: 'question', question: { kind: 'save_file' } });
         expect(kindOf(await answer(existing, true))).toBe('done');
-        expect(answers).toEqual([existing, join(home, 'new.xisf'), home, [existing, existing], existing]);
+        // As PixInsight takes paths: with forward slashes on every system.
+        expect(answers).toEqual([pix(existing), pix(join(home, 'new.xisf')), pix(home), [pix(existing), pix(existing)], pix(existing)]);
       });
 
       it('cancels a file chooser by closing, and by the answer false', async () => {

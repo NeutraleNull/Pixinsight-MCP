@@ -191,8 +191,8 @@ describe('runs of WBPP in an instance of their own', () => {
     started().end(0);
     await waitUntil(async () => (await new SlotLeases(join(home, 'leases')).slots()).length === 0);
 
-    // Another server, which is alive, holds the next one.
-    const other = new SlotLeases(join(home, 'leases'), () => true, process.pid + 1);
+    // Another server, which is alive, holds the next one: a process that is there on every system, and is not this one.
+    const other = new SlotLeases(join(home, 'leases'), () => true, process.ppid);
     cli.instances = cli.instances.filter((instance) => instance.slot !== 241);
     cli.addInstance(241);
     await other.claim(242, null);

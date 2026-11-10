@@ -116,7 +116,12 @@ export class FakePixInsight implements PixInsightCli {
     const job = JSON.parse(await readFile(join(jobDir, 'job.json'), 'utf8')) as JobFile;
     this.awaited.push(await readFile(join(jobDir, 'awaited'), 'utf8').catch(() => 'missing'));
     this.ran.push({ slot, op: job.op, args: job.args });
-    void this.scriptsBefore.then(() => this.answer(job, jobDir));
+    // A job can outlast its test, whose folder is gone by the time its answer is written.
+    void this.scriptsBefore
+      .then(() => this.answer(job, jobDir))
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
   }
 
   private async answer(job: JobFile, jobDir: string): Promise<void> {
