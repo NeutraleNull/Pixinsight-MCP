@@ -11,7 +11,7 @@ applies_to: [narrowband, mono, linear]
 ## Steps
 
 1. Find the `.xmars` database files. If you do not know where they are, ask the user.
-2. Run `SpectrophotometricFluxCalibration` on the image first. Otherwise the correction fails with `The target image lacks flux calibration metadata (PCL:SPFC:ScaleFactors)`. For narrowband data set `narrowbandMode: true`, `generateGraphs: false`, the line in `grayFilterWavelength` (Hα 656.3, OIII 500.7, SII 671.6 nm), and the filter bandwidth in `grayFilterBandwidth`. Ask for the bandwidth. If you have to assume one, say so.
+2. Run `SpectrophotometricFluxCalibration` on the image first. Otherwise the correction fails with `The target image lacks flux calibration metadata (PCL:SPFC:ScaleFactors)`. For narrowband data set `narrowbandMode: true`, `generateGraphs: false`, the line in `grayFilterWavelength` (Hα 656.3, OIII 500.7, SII 671.6 nm), and the filter bandwidth in `grayFilterBandwidth`. Ask for the bandwidth before you start, as `practices/equipment` describes. If you have to assume one, say so.
 3. Run `MultiscaleGradientCorrection` with its automatic scale factors.
 4. Compare `gradientScale` 1024, the default, with 2048. In one field, 2048 gave a smoother Hα model without a nebula-shaped hole, at least as flat a sky, and an amplitude of 2.3e-5 instead of 4.0e-5.
 

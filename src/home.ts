@@ -15,6 +15,9 @@ export interface HomePaths {
   closeAllPath: string;
   beginLogPath: string;
   endLogPath: string;
+  /** Not a script of its own: the server puts its text in front of a script whose dialogs it serves. */
+  dialogHookPath: string;
+  dialogUnhookPath: string;
   opsDir: string;
   enumChecksPath: string;
 }
@@ -61,6 +64,8 @@ export async function prepareHome(home: string, source: string = defaultScriptsS
     closeAllPath: join(scripts, 'close_all.js'),
     beginLogPath: join(scripts, 'begin_log.js'),
     endLogPath: join(scripts, 'end_log.js'),
+    dialogHookPath: join(scripts, 'dialogs', 'hook.js'),
+    dialogUnhookPath: join(scripts, 'dialogs', 'unhook.js'),
     opsDir: join(scripts, 'ops'),
     enumChecksPath: join(home, 'enum-checks.json'),
   };

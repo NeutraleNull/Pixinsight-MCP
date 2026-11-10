@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { CliError, type InstanceInfo, type PixInsightCli } from '../../src/bridge/cli.js';
-import { SharedTarget } from '../../src/bridge/target.js';
+import { CliError, type InstanceInfo, type PixInsightCli } from '../../../src/bridge/cli.js';
+import { SharedTarget } from '../../../src/bridge/target.js';
 
 const SHADOW = 250;
 const WORKER = 200;
@@ -15,6 +15,8 @@ function fakeCli(initial: InstanceInfo[] | null): PixInsightCli & { instances: I
     },
     async execute() {},
     launch() {},
+    runToExit: () => ({ pid: undefined, exited: Promise.resolve(null) }),
+    endRun() {},
     async terminate() {},
     kill() {},
     isRunning: () => true,

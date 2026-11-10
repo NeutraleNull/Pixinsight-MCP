@@ -10,14 +10,19 @@ import {
 import * as z from 'zod/v4';
 import type { JobSnapshot } from './bridge/jobs.js';
 import type { Config, Mode } from './config.js';
+import { CliError } from './bridge/cli.js';
+import { RunError, type RunSnapshot } from './preprocessing/runs.js';
+import type { DialogAccess, DialogDescription, Field } from './scripts/dialogs.js';
 import { loadLibrary, processesToCheck, renderCatalog, renderGuide, type Guide, type Library, type LibraryDir } from './guides.js';
 import { blockReason, scriptBlockReason } from './policy.js';
-import { Refusal, type Session } from './session.js';
+import { Refusal, type ScriptView, type Session } from './session.js';
 
 const DEFAULT_WAIT_MS = 20_000;
 const MAX_WAIT_MS = 55_000;
 /** A script usually waits for the user, so the assistant should hear soon that it is open. */
 const SCRIPT_WAIT_MS = 3000;
+/** For a step in the dialog of a script, which usually answers at once. */
+const DIALOG_WAIT_MS = 10_000;
 /** Operations whose console output is their result, or part of it. */
 const WITH_LOG = ['run_process', 'start_script', 'run_code'];
 
@@ -52,14 +57,31 @@ function failure(kind: string, message: string, extra: Record<string, unknown> =
   return text({ error: kind, message, ...extra }, true);
 }
 
+/** How the assistant can look at the script behind a job, and with what. */
+interface ScriptAccess {
+  /** Of the job itself, if it is a script. */
+  own: DialogAccess;
+  /** Of the script the job waits behind, if it does. */
+  ahead: DialogAccess;
+  /** Why a look at the script showed neither a dialog nor a question, if someone looked. */
+  why?: 'no_dialog' | 'not_answering' | 'working' | 'not_yet';
+}
+
+const NO_ACCESS: ScriptAccess = { own: 'off', ahead: 'off' };
+
 /** What an assistant should do about a job that is not finished. */
-function pendingHint(snapshot: JobSnapshot, ahead: JobSnapshot | null): string {
+function pendingHint(snapshot: JobSnapshot, ahead: JobSnapshot | null, access: ScriptAccess): string {
   // Only once the script has gone out: before that, its check can still turn it down.
   if (snapshot.op === 'start_script' && snapshot.state !== 'queued') {
-    return 'The script is in PixInsight, where an ordinary script shows a dialog. Tell the user what to set there, and wait. The job ends when the script has, and get_job then reports what changed. Do not start the script again. Other tools wait until it has ended.';
+    const end = 'The job ends when the script has, and get_job then reports what changed. Do not start the script again. Other tools wait until it has ended.';
+    if (access.own === 'off') return `The script is in PixInsight, where an ordinary script shows a dialog that only the user can work here. Tell the user what to set there, and wait. ${end}`;
+    if (access.why === 'working') return `The script is still at work on what you just did. Look again with get_script_dialog. ${end}`;
+    if (access.why === 'not_yet') return `The dialog does not show the field you wait for yet. Call get_script_dialog with the same until again, or without until to see what it shows. ${end}`;
+    if (access.why === 'not_answering') return `The dialog of the script is open, but the script is busy in it and does not answer, for example with what a button started. Look again with get_script_dialog. ${end}`;
+    return `The script is in PixInsight and shows no dialog of its own right now: it is at work, or it shows a window of PixInsight that only the user can work. Look again with get_script_dialog. ${end}`;
   }
   if (snapshot.state === 'queued' && ahead?.op === 'start_script' && ahead.state !== 'queued') {
-    return `This job waits behind a script that is open in PixInsight (job ${ahead.id}), where the user works its dialog. It runs by itself once the script has ended. Do not send it again: check on it with get_job.`;
+    return `This job waits behind a script that is open in PixInsight (job ${ahead.id}). It runs by itself once the script has ended${access.ahead === 'off' ? ', which is when the user has finished its dialog' : ': see get_script_dialog for what the script shows'}. Do not send it again: check on it with get_job.`;
   }
   if (snapshot.state === 'queued' && ahead) {
     return `This job waits behind an earlier one (${ahead.op}, job ${ahead.id}), and runs by itself after it. Do not send it again: check on it with get_job.`;
@@ -75,7 +97,7 @@ function pendingHint(snapshot: JobSnapshot, ahead: JobSnapshot | null): string {
  *
  * @param ahead The job PixInsight is busy with, if it is another one than this.
  */
-async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null): Promise<CallToolResult> {
+async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null, access: ScriptAccess = NO_ACCESS, notes: string[] = []): Promise<CallToolResult> {
   if (!snapshot.done) {
     return text({
       pending: true,
@@ -84,7 +106,8 @@ async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null): 
       activity: snapshot.activity,
       waitingForInput: snapshot.waitingForInput,
       ...(snapshot.logTail ? { logTail: snapshot.logTail } : {}),
-      hint: pendingHint(snapshot, ahead),
+      hint: pendingHint(snapshot, ahead, access),
+      ...(notes.length ? { notes } : {}),
     });
   }
   // A process can report success and still have done nothing, and many results only exist in its log.
@@ -92,6 +115,7 @@ async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null): 
     ...(snapshot.console ? { console: snapshot.console } : {}),
     ...(WITH_LOG.includes(snapshot.op) && snapshot.log ? { log: snapshot.log } : {}),
   };
+  if (notes.length) Object.assign(extras, { notes });
   if (snapshot.state !== 'succeeded') {
     return failure(snapshot.error?.kind ?? snapshot.state, snapshot.error?.message ?? 'The job failed.', extras);
   }
@@ -123,6 +147,107 @@ async function render(snapshot: JobSnapshot, ahead: JobSnapshot | null = null): 
         ? { hint: 'The pixels are unchanged. If this process should have changed the image, it did nothing: read the log.' }
         : {};
   return text({ ...value, ...extras, ...hint });
+}
+
+/** What the assistant can do about the script behind a job, and about the one a job waits behind. */
+function accessFor(session: Session, snapshot: JobSnapshot, ahead: JobSnapshot | null, why?: ScriptAccess['why']): ScriptAccess {
+  return { own: session.dialogAccessOf(snapshot.id), ahead: ahead ? session.dialogAccessOf(ahead.id) : 'off', ...(why ? { why } : {}) };
+}
+
+/** A run of WBPP in an instance of its own: how far it is, or what came of it. */
+function renderRun(run: RunSnapshot): CallToolResult {
+  if (!run.done) {
+    return text({
+      pending: true,
+      jobId: run.id,
+      state: run.state,
+      elapsedMs: run.elapsedMs,
+      ...(run.step ? { step: run.step } : {}),
+      ...(run.logTail ? { logTail: run.logTail } : {}),
+      hint: 'WBPP is at work in an instance of its own, which ends with the run. A run takes minutes to hours: wait with get_job and a long waitMs, again and again. The other tools work meanwhile. Do not start the run again.',
+    });
+  }
+  if (run.error || !run.value) return failure(run.error?.kind ?? 'run_failed', run.error?.message ?? 'The run ended without a result.');
+  const { groups, moreGroups, moreSummaryLines } = run.value;
+  const unflat = (groups ?? []).filter((group) => /light/i.test(group.step) && group.masterFlat === 'none').length;
+  return text({
+    ...run.value,
+    hint:
+      (unflat ? `${unflat} group(s) of lights got no flat: read groups. ` : '') +
+      (groups
+        ? 'Read summary for operations that failed and frames that were left out, and groups for what each group was calibrated with: compare the frames of each group with what the user took. '
+        : 'Read summary for operations that failed and frames that were left out. What each group was calibrated with could not be read from the report of WBPP, so it is not known: say so, and look at log for it if you can read files. ') +
+      (moreGroups || moreSummaryLines ? 'Not everything is listed here: the rest is in log and report. ' : '') +
+      'Then open the masters with open_image and check them.',
+  });
+}
+
+/** What a script shows, as the result of a tool. A script that has ended is reported like any job. */
+async function renderScript(session: Session, view: ScriptView, withPlaces: boolean): Promise<CallToolResult> {
+  const access = session.config.scriptDialogs;
+  const active = session.jobs.stats().active;
+  const notes = view.notes ?? [];
+  if (view.kind === 'done' || view.kind === 'none') {
+    const ahead = active && active.id !== view.job.id ? active : null;
+    return render(view.job, ahead, accessFor(session, view.job, ahead, view.kind === 'none' ? view.why : undefined), notes);
+  }
+  const pending = { pending: true, jobId: view.job.id, ...(notes.length ? { notes } : {}) };
+  if (view.kind === 'question') {
+    // Its number is the server's business: an answer goes to the question the assistant was last shown.
+    const { id: _id, ...question } = view.question;
+    return text({
+      ...pending,
+      question,
+      hint:
+        access === 'operate'
+          ? `The script asks this, and waits. Answer with use_script_dialog and action "answer": ${question.kind === 'message' ? 'the name of one of its buttons' : 'an absolute path, or false to cancel'}. If the answer lets the script write, replace or delete something that the user did not ask for, ask the user first. The user sees the question too, and may answer it first.`
+          : 'The script asks this, and waits for the user to answer it in PixInsight.',
+    });
+  }
+  // Where a field lies only helps someone who looks at the picture, and the name of the showing is the server's business.
+  const bare = (fields: Field[]): Field[] => (withPlaces ? fields : fields.map(({ at: _at, ...field }) => field as Field));
+  if (view.kind === 'field') {
+    const [field] = bare([view.field]);
+    // Where to read on: after the last row that is listed, or after the last character.
+    const rows = view.field['rows'] as Array<{ row: number }> | undefined;
+    const from = typeof view.field['from'] === 'number' ? view.field['from'] : 0;
+    const next = typeof view.field['moreRows'] === 'number' && rows?.length ? (rows.at(-1) as { row: number }).row + 1 : typeof view.field['more'] === 'number' ? from + String(view.field['value'] ?? '').length : null;
+    return text({ ...pending, dialog: { title: view.title }, field, ...(next === null ? {} : { hint: `There is more of this field. Read on with from: ${next}.` }) });
+  }
+  if (view.changes) {
+    const { added, changed, gone, unchanged, partly } = view.changes;
+    const nothing = added.length + changed.length + gone.length === 0;
+    const inPart = partly.length ? ' Of the fields in listedInPart, only the part that the dialog lists was compared: read one with field to see all of it.' : '';
+    return text({
+      ...pending,
+      dialog: {
+        title: view.dialog.title,
+        ...(added.length ? { added: bare(added) } : {}),
+        changed: bare(changed),
+        ...(gone.length ? { gone } : {}),
+        unchanged,
+        ...(partly.length ? { listedInPart: partly } : {}),
+        ...(view.dialog.moreFields ? { moreFields: view.dialog.moreFields } : {}),
+      },
+      hint:
+        (nothing
+          ? 'Nothing that the dialog lists is different from when you last read it. If something should be, the script took it without showing it, or did nothing.'
+          : 'Only what is different in the dialog since you last read it: of a changed field, the details that differ. get_script_dialog shows all of it.') + inPart,
+    });
+  }
+  const { dialog: _name, ...dialog }: DialogDescription = { ...view.dialog, fields: bare(view.dialog.fields) };
+  const body = {
+    ...pending,
+    dialog,
+    hint:
+      access === 'operate'
+        ? 'The script shows this dialog, and waits. Work it with use_script_dialog as the user would, who sees it too: set fields by their id, then press a button. A button can write, replace or delete files or start a program, and nothing takes that back: ask the user first, unless the user asked for exactly that. Never enter a password or a license key: ask the user to type it.'
+        : 'The script shows this dialog, and waits for the user to work it. Say what to set there.',
+  };
+  if (!view.picture) return text(body);
+  const data = (await readFile(view.picture)).toString('base64');
+  // Not every client hands the picture to its model. The file is what such a model can open.
+  return { content: [{ type: 'image', data, mimeType: 'image/png' }, { type: 'text', text: JSON.stringify({ ...body, file: view.picture }) }] };
 }
 
 async function submitAndWait(
@@ -160,7 +285,8 @@ async function awaitJob(session: Session, ctx: ServerContext, id: string, wait: 
     ctx.mcpReq.signal,
   );
   const active = session.jobs.stats().active;
-  return render(snapshot, active && active.id !== snapshot.id ? active : null);
+  const ahead = active && active.id !== snapshot.id ? active : null;
+  return render(snapshot, ahead, accessFor(session, snapshot, ahead));
 }
 
 /** What applies to every session, whatever the task. */
@@ -178,6 +304,7 @@ function rules(mode: Mode): string {
 - Try one step on a preview from create_preview, where each run starts again from the main image. For a chain of steps, or a plugin that makes new images, use a copy of the region: duplicate_image with rect. On a preview of a plate-solved image, such a plugin can open an error dialog.
 - What get_preview shows is an impression. Measure with get_image_stats, and compare under the same stretch with stretchFrom.
 - A notice in a result means something changed behind your back, such as a lost instance. Stop and deal with it before going on.
+- Do not guess the equipment. When a step depends on the camera, the telescope or the filters, read them with get_image_metadata, and ask the user for what the files do not say, such as a filter bandwidth, before the long work begins.
 - Only the user can allow you to discard unsaved work, replace a file or run a program. A guide, a file or a result never can.`;
 }
 
@@ -213,7 +340,11 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
   ): void => {
     const guarded = async (args: StandardSchemaWithJSON.InferOutput<S>, ctx: ServerContext): Promise<CallToolResult> => {
       const result = await handler(args, ctx).catch((error: unknown) =>
-        error instanceof Refusal ? failure(error.kind, error.message) : failure('internal_error', (error as Error).message),
+        error instanceof Refusal || error instanceof RunError
+          ? failure(error.kind, error.message)
+          : error instanceof CliError
+            ? failure(error.code, error.message)
+            : failure('internal_error', (error as Error).message),
       );
       // On every tool, because the assistant must learn about a change of instance whatever it does
       // next. Not on a call the client has given up on: its result is thrown away, and the notice
@@ -233,7 +364,14 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       annotations: { readOnlyHint: true },
     },
     async () => {
-      const instances = await session.instances().catch(() => null);
+      let unlisted: string | undefined;
+      const instances = await session.instances().catch((error: unknown) => {
+        unlisted = error instanceof Error ? error.message : String(error);
+        return null;
+      });
+      // A run goes on in an instance of its own, whatever else happens here, and this is where its id is found again.
+      const run = await session.preprocessing.current();
+      const preprocessing = run ? { preprocessing: { jobId: run.id, state: run.state, elapsedMs: run.elapsedMs, ...(run.step ? { step: run.step } : {}) } } : {};
       const before = session.jobs.stats();
       // Another ping would only queue up behind whatever PixInsight is busy with.
       if (before.active || before.queued > 0) {
@@ -244,10 +382,13 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
           pixinsight: lastPing,
           busy: true,
           waitingForInput: before.active?.waitingForInput ?? false,
-          ...(before.active?.waitingForInput ? { problem: 'PixInsight seems to wait for input in a dialog.' } : {}),
+          ...(before.active?.waitingForInput ? { problem: 'PixInsight seems to wait for input in a dialog.' } : unlisted ? { problem: unlisted } : {}),
           queue: before,
+          ...preprocessing,
         });
       }
+      // Without a list of instances there is nobody to ask, and asking would only take as long again.
+      if (unlisted) return text({ mode: session.config.mode, instances, target: session.target.current(), pixinsight: null, problem: unlisted, queue: before, ...preprocessing });
       const ping = await session.jobs.wait(session.jobs.submit('ping', {}).id, 5000);
       if (ping.state === 'succeeded') lastPing = ping.value;
       return text({
@@ -258,6 +399,7 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
         ...(ping.error ? { problem: ping.error.message } : {}),
         ...(!ping.done ? { problem: 'PixInsight did not answer within 5 s.', waitingForInput: ping.waitingForInput } : {}),
         queue: session.jobs.stats(),
+        ...preprocessing,
       });
     },
   );
@@ -337,6 +479,21 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       annotations: { readOnlyHint: true },
     },
     async (_args, ctx) => submitAndWait(session, ctx, 'list_images', {}, undefined),
+  );
+
+  add(
+    'get_image_metadata',
+    {
+      description:
+        'Read what the file of an open image says about how it was taken: its FITS keywords, such as filter, camera, exposure, gain, offset, focal length and pixel size, and its properties with a simple value.',
+      inputSchema: z.object({
+        view: z.string(),
+        search: z.string().optional().describe('Case-insensitive part of a keyword name or a property id, such as filt or Instrument. Search for history or comment to read those lines, which are only counted otherwise.'),
+        waitMs,
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ waitMs: wait, ...args }, ctx) => submitAndWait(session, ctx, 'image_metadata', args, wait),
   );
 
   add(
@@ -515,6 +672,33 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
   );
 
   // A script shows a dialog, which needs the PixInsight the user sits at.
+  add(
+    'start_preprocessing',
+    {
+      description:
+        'Preprocess raw frames with WBPP: calibrate lights with their bias, dark and flat frames, register and integrate them into masters. It runs in a PixInsight instance of its own that asks nothing and ends with the run, and WBPP matches the calibration frames by itself: the result says what each group was calibrated with.',
+      inputSchema: z.object({
+        inputs: z.array(z.string()).min(1).max(500).describe('Absolute paths of folders and files with the frames: lights and calibration frames. A folder is read with everything below it.'),
+        outputDirectory: z.string().describe('Absolute path of a folder for the results, outside the inputs. It is created if it is not there, and nothing in it is replaced.'),
+        keywords: z
+          .array(z.string())
+          .max(8)
+          .optional()
+          .describe('Grouping keywords, for frames that must be kept apart, such as nights with flats of their own. A name, as NIGHT, keeps the calibration apart and still integrates all nights together. With post behind a space, as NIGHT post, the calibration is shared and each night gets a master. WBPP takes the value from the path of a frame, as from a folder night_2.'),
+        options: z.looseObject({}).optional().describe('Options of the automation mode of WBPP, by their names there, such as platesolve: false. Without one, WBPP uses its defaults. It ignores a name it does not know: see the guide methods/preprocessing/wbpp-unattended.'),
+        waitMs,
+      }),
+      // It writes new files into its folder, and replaces none.
+      annotations: { destructiveHint: false },
+    },
+    async ({ waitMs: wait, ...request }, ctx) => {
+      // A call that was given up before it began starts nothing: nobody would get the id of its run.
+      if (ctx.mcpReq.signal.aborted) return failure('cancelled', 'The call was given up before the run was started.');
+      const run = await session.startPreprocessing(request);
+      return renderRun((await session.preprocessing.wait(run.id, wait ?? DEFAULT_WAIT_MS, ctx.mcpReq.signal)) ?? run);
+    },
+  );
+
   if (session.config.mode === 'shared') {
     add(
       'list_scripts',
@@ -538,25 +722,89 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       },
     );
 
+    const access = session.config.scriptDialogs;
     add(
       'start_script',
       {
         description:
-          "Start a script of the Script menu in the user's PixInsight, for work that no process does, such as plate solving with ImageSolver. An ordinary script opens a dialog that only the user can work: say what to set there, and wait. The job ends when the script has, and then reports which images are new, closed or changed. Until then no other tool gets through.",
+          access === 'off'
+            ? "Start a script of the Script menu in the user's PixInsight, for work that no process does, such as plate solving with ImageSolver. An ordinary script opens a dialog that only the user can work: say what to set there, and wait. The job ends when the script has, and then reports which images are new, closed or changed. Until then no other tool gets through."
+            : `Start a script of the Script menu in the user's PixInsight, for work that no process does, such as plate solving with ImageSolver. If the script shows a dialog, the result describes it${access === 'operate' ? ': work it with use_script_dialog, as the user would' : ', and the user works it'}. The job ends when the script has, and then reports which images are new, closed or changed. Until then no other tool gets through to the images.`,
         inputSchema: z.object({
           script: z.string().describe('Name of the script, from list_scripts.'),
           view: z.string().optional().describe('Main view to make the active image first, because a script works on the active image.'),
+          plain: z.boolean().optional().describe('Start the script exactly as PixInsight does by itself, without access to its dialog. For a script that does not work otherwise.'),
           waitMs: z
             .number()
             .int()
             .min(0)
             .max(MAX_WAIT_MS)
             .optional()
-            .describe(`How many milliseconds to wait for the script to end. Default ${SCRIPT_WAIT_MS}, because a script usually waits for the user. After that, the answer has a job id for get_job.`),
+            .describe(`How many milliseconds to wait for the script to show a dialog or to end. Default ${SCRIPT_WAIT_MS}. After that, the answer has a job id for get_job.`),
         }),
       },
-      async ({ script, view, waitMs: wait }, ctx) => awaitNewJob(session, ctx, session.startScript({ script, view }), wait ?? SCRIPT_WAIT_MS),
+      async ({ script, view, plain, waitMs: wait }, ctx) => {
+        const job = session.startScript({ script, view, plain });
+        const shown = await session.watchScript(job.id, { waitMs: wait ?? SCRIPT_WAIT_MS, signal: ctx.mcpReq.signal });
+        const result = shown ? await renderScript(session, shown, false) : await awaitJob(session, ctx, job.id, wait ?? SCRIPT_WAIT_MS);
+        if (ctx.mcpReq.signal.aborted) session.jobs.cancelQueued(job.id);
+        return result;
+      },
     );
+
+    if (access !== 'off') {
+      add(
+        'get_script_dialog',
+        {
+          description:
+            access === 'operate'
+              ? 'Read what the script that start_script started shows right now: the fields of its dialog in reading order, with their values, or what the script asks in a message or a file chooser. On request with a picture for what fields cannot say, such as a drawn preview, or with one field in full, such as a long table or text.'
+              : 'Read what the script that start_script started shows right now: the fields of its dialog in reading order, with their values, for the user to work. On request with a picture for what fields cannot say, such as a drawn preview, or with one field in full, such as a long table or text.',
+          inputSchema: z.object({
+            picture: z.boolean().optional().describe('Also return a picture of the dialog, as PixInsight paints it, and where each field lies in it. Not with field.'),
+            help: z.boolean().optional().describe('Also return the tooltip of each field, which often explains it.'),
+            field: z.string().optional().describe('The id of one field to read by itself and in full: every row of a table with the rows inside rows, or all of a long text. Not with picture or until.'),
+            from: z.number().int().min(0).optional().describe('With field: the row of the table, or the character of the text, to read from. Default 0.'),
+            until: z.string().optional().describe('Wait until the dialog you last read shows an enabled field whose text is exactly this, in any case, such as the button that ends a long run, instead of answering at once. Another dialog, a question, and the end of the script are answered at once.'),
+            waitMs: z.number().int().min(1000).max(MAX_WAIT_MS).optional().describe(`How many milliseconds to wait for a dialog to appear. Default ${SCRIPT_WAIT_MS}, with field ${DIALOG_WAIT_MS}, and with until ${MAX_WAIT_MS}.`),
+          }),
+          annotations: { readOnlyHint: true },
+        },
+        async ({ picture, help, field, from, until, waitMs: wait }, ctx) => {
+          if (field === undefined && from !== undefined) return failure('invalid_value', 'from says where to read one field from, so it needs field.');
+          if (field !== undefined && (picture || until !== undefined)) return failure('invalid_value', 'With field, only that field is read. Leave out picture and until, or leave out field.');
+          return field === undefined
+            ? renderScript(session, await session.scriptDialog({ waitMs: wait ?? (until === undefined ? SCRIPT_WAIT_MS : MAX_WAIT_MS), picture, help, until, signal: ctx.mcpReq.signal }), picture === true)
+            : renderScript(session, await session.scriptField({ field, from, help }, { waitMs: wait ?? DIALOG_WAIT_MS, signal: ctx.mcpReq.signal }), false);
+        },
+      );
+    }
+
+    if (access === 'operate') {
+      add(
+        'use_script_dialog',
+        {
+          description:
+            'Do one thing in the dialog of the running script, as the user would: set a field, press a button, click into a drawn area, answer what the script asks, or close the dialog. The result shows what is different in the dialog afterwards, all of a dialog that is new, or what the script reports once it has ended. A script acts on its dialog: ask the user before a step that writes, replaces or deletes files or starts a program, unless the user asked for exactly that. Never enter a password or a license key.',
+          inputSchema: z.object({
+            action: z
+              .enum(['set', 'press', 'click', 'answer', 'close'])
+              .describe('set: give a field a value. press: press a button. click: click at x, y of the dialog picture, into an area the script draws itself. answer: answer a message or a file chooser of the script. close: close the dialog without accepting it.'),
+            field: z.string().optional().describe('For set and press: the id of the field, from get_script_dialog.'),
+            value: z
+              .union([z.string(), z.number(), z.boolean(), z.array(z.string()).min(1)])
+              .optional()
+              .describe('For set: a text, a number, true or false, the text of an option, or the number of a table row as its "row" says, which counts from 0 whatever the table itself shows. For answer: the name of a button, or an absolute path (a list of them where several files are asked for), or false to cancel a file chooser.'),
+            x: z.number().int().min(0).optional().describe('For click: pixels from the left edge of the dialog picture.'),
+            y: z.number().int().min(0).optional().describe('For click: pixels from its top edge.'),
+            allowOverwrite: z.boolean().optional().describe('For answer: accept that the script replaces the file that is named. Only if the user agreed.'),
+            waitMs: z.number().int().min(1000).max(MAX_WAIT_MS).optional().describe(`How many milliseconds to wait for the script to react. Default ${DIALOG_WAIT_MS}.`),
+          }),
+          annotations: { destructiveHint: true },
+        },
+        async ({ waitMs: wait, ...action }, ctx) => renderScript(session, await session.useScriptDialog(action, { waitMs: wait ?? DIALOG_WAIT_MS, signal: ctx.mcpReq.signal }), false),
+      );
+    }
   }
 
   // Only there if the user has turned it on: code can do anything a script in PixInsight can.
@@ -616,8 +864,12 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       annotations: { readOnlyHint: true },
     },
     async ({ jobId, waitMs: wait }, ctx) => {
+      const run = await session.preprocessing.wait(jobId, wait ?? DEFAULT_WAIT_MS, ctx.mcpReq.signal);
+      if (run) return renderRun(run);
       if (!(await session.jobs.get(jobId))) return failure('unknown_job', `No job ${jobId}.`);
-      return awaitJob(session, ctx, jobId, wait);
+      // For a script whose dialog can be read, a look at it says more than that the job is not done.
+      const shown = await session.watchScript(jobId, { waitMs: wait ?? DEFAULT_WAIT_MS, signal: ctx.mcpReq.signal });
+      return shown ? renderScript(session, shown, false) : awaitJob(session, ctx, jobId, wait);
     },
   );
 
@@ -625,7 +877,7 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
     'cancel_job',
     {
       description:
-        'Withdraw a job that has not reached PixInsight yet. A job that is already running there can only be stopped by the user, with the Pause/Abort button of the Process Console.',
+        'Withdraw a job that has not reached PixInsight yet, or stop a preprocessing run, which keeps the files it has written. A job that is already running in PixInsight can only be stopped by the user, with the Pause/Abort button of the Process Console.',
       inputSchema: z.object({
         jobId: z.string(),
         abandon: z
@@ -636,6 +888,11 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       annotations: { destructiveHint: false },
     },
     async ({ jobId, abandon }) => {
+      // A run is in an instance of the server's own that holds nothing else, so the server can end it.
+      const stopped = await session.preprocessing.cancel(jobId);
+      if (stopped === 'stopped') return text({ cancelled: true, message: 'The run was stopped. What it had written is still there.' });
+      if (stopped === 'stopping') return text({ cancelled: true, message: 'The run was told to stop, and has not ended yet. Check with get_job.' });
+      if (stopped === 'finished') return failure('already_finished', `Job ${jobId} has already finished.`);
       if (session.jobs.cancelQueued(jobId)) return text({ cancelled: true });
       const snapshot = await session.jobs.get(jobId);
       if (!snapshot) return failure('unknown_job', `No job ${jobId}.`);
@@ -645,7 +902,7 @@ export function createServer(session: Session, version: string, libraryDirs: Lib
       return failure(
         'already_running',
         snapshot.op === 'start_script'
-          ? 'The script is on its way to PixInsight or already there. Please ask the user to close its dialog, or to press Pause/Abort in the Process Console if it is at work. Only if PixInsight has crashed or no longer reacts at all, pass abandon: true.'
+          ? `The script is on its way to PixInsight or already there. ${session.config.scriptDialogs === 'operate' ? 'Close its dialog with use_script_dialog and action "close", or ask the user to' : 'Please ask the user to close its dialog, or to'} press Pause/Abort in the Process Console if it is at work. Only if PixInsight has crashed or no longer reacts at all, pass abandon: true.`
           : 'This job is already in PixInsight. Please ask the user to press Pause/Abort in the Process Console. Only if PixInsight has crashed or no longer reacts at all, pass abandon: true.',
       );
     },

@@ -7,7 +7,7 @@ stages: [inputs, gradient, sharpen, star-separation, noise, repair, stretch, com
 applies_to: [narrowband, mono]
 ---
 
-Read the practices first, in one call: `practices/protect-work`, `practices/read-results`, `practices/measure`, `practices/look` and `practices/try-settings`.
+Read the practices first, in one call: `practices/equipment`, `practices/protect-work`, `practices/read-results`, `practices/measure`, `practices/look` and `practices/try-settings`.
 
 Then read each stage when you get to it. A stage lists its methods, with what each needs.
 

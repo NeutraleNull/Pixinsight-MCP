@@ -26,11 +26,13 @@ Write from a real run, say how to check the result, and use your own words.
    npm test
    ```
 
-4. If your change touches how the server talks to PixInsight, also run the live tests. They start their own windowless PixInsight on slots 230 to 239, and leave your own instance alone:
+4. If your change touches how the server talks to PixInsight, also run the live tests. They start their own windowless PixInsight on slots 230 to 246, and leave your own instance alone:
 
    ```bash
    npm run test:live
    ```
+
+   Run them while no other assistant session works with PixInsight. If many tests fail after 20 to 30 seconds each, look for clients of `PixInsight -e` that never return before you look at your change: [Command line and instances](docs/reference/pixinsight-behaviour.md#command-line-and-instances) has what that is and how to get out of it.
 
 > [!IMPORTANT]
 > Never add PixInsight or PCL source code or documentation to this repository, not even as an excerpt in a test or a guide. Their licenses do not allow it. Describe behaviour in your own words, from what you measured.

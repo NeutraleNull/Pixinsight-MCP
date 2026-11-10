@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { SlotLeases } from '../../src/bridge/lease.js';
+import { SlotLeases } from '../../../src/bridge/lease.js';
 
 /** Several servers are played by several objects with pids of their own. None of them is a real process. */
 describe('SlotLeases', () => {

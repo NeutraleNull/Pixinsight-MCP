@@ -89,3 +89,18 @@ export function parameterRefusal(
   }
   return null;
 }
+
+/** Options of the automation mode of WBPP that the tool sets itself, or that belong to the tests of WBPP. */
+const RESERVED_PREPROCESS_OPTIONS = new Set(['automationmode', 'dir', 'file', 'keywords', 'outputdirectory', 'outputdir', 'testfile', 'loadonly', 'recordtest', 'filesearchrootpath', 'paramlist']);
+/** Such an option makes WBPP run a script file as a part of its pipeline. */
+const SCRIPT_OPTION = /script/i;
+/** WBPP compiles the value of such an option into a function, to select frames with. */
+const FORMULA_OPTION = /formula/i;
+
+/** Returns why an option of WBPP's automation mode cannot be passed, or null if it can. */
+export function preprocessOptionRefusal(name: string): string | null {
+  if (RESERVED_PREPROCESS_OPTIONS.has(name.toLowerCase())) return 'the tool sets it itself, or it belongs to the tests of WBPP';
+  if (SCRIPT_OPTION.test(name)) return 'it makes WBPP run a script file, which is running code';
+  if (FORMULA_OPTION.test(name)) return 'WBPP evaluates its value as code';
+  return null;
+}

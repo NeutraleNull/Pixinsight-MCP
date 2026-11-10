@@ -55,7 +55,7 @@ Other jobs wait behind a running one. `get_status` shows the queue.
 |---|---|
 | Still in the server's queue | Ask the assistant to [cancel it](../reference/tools.md#cancel_job) |
 | Running in PixInsight | Press **Pause/Abort** in the Process Console and confirm |
-| A [script](run-scripts-and-code.md) with its dialog open | Close the dialog in PixInsight. The job then ends by itself |
+| A [script](run-scripts-and-code.md) with its dialog open | Close the dialog in PixInsight. The job then ends by itself. An assistant that may [work dialogs](run-scripts-and-code.md#let-the-assistant-work-the-dialog) can close it too |
 | Stuck, with no dialog open, and the queue does not move | Ask the assistant to [abandon it](../reference/tools.md#cancel_job) |
 
 After an abort, the job ends with the error `aborted`, the image stays in its previous state, and PixInsight stays healthy.
@@ -106,6 +106,23 @@ To limit what a crash can cost, save intermediate results, especially before you
 A crashed instance cannot remove its swap files. If your swap folder is the system temporary folder, on many Linux systems they then keep using memory until the next restart.
 
 To find them, look for files named `~PI~*.swp` in the swap folder. Delete only files older than the current PixInsight session. Newer ones may belong to a running instance.
+
+## When PixInsight no longer lists its instances
+
+The assistant reports `cli_timeout` on every step: PixInsight did not answer when the server asked it which instances are running. Your PixInsight keeps working, and no image is affected. This was seen on Linux.
+
+The cause is a lock of PixInsight's command line that was left behind in a state that nothing releases. It can come about when two programs call that command line at the same moment, which is why the server calls it one at a time.
+
+To check, ask for the list yourself in a terminal. If the command does not return within a few seconds, end it with <kbd>Ctrl</kbd>+<kbd>C</kbd>:
+
+```bash
+/opt/PixInsight/bin/PixInsight.sh -e
+```
+
+To clear the lock:
+
+1. Save your work in PixInsight, and close it.
+2. Restart the computer.
 
 ## When the assistant reports the wrong images
 

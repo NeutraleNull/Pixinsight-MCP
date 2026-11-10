@@ -1,5 +1,5 @@
 import { existsSync, statSync } from 'node:fs';
-import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -601,6 +601,105 @@ describe.skipIf(!existsSync(EXECUTABLE))('against a real PixInsight', { timeout:
 
     afterAll(async () => {
       await close(GRADIENT);
+    });
+
+    it('names no control at a place inside a table or a text box, which is why a dialog is not read by places alone', async () => {
+      const found = await inPixInsight<string[]>(`
+        var dialog = new Dialog;
+        var label = new Label( dialog );
+        label.text = "A label";
+        var table = new TreeBox( dialog );
+        table.numberOfColumns = 1;
+        table.setScaledMinSize( 240, 120 );
+        ( new TreeBoxNode( table ) ).setText( 0, "A row" );
+        var text = new TextBox( dialog );
+        text.text = "A text";
+        text.setScaledMinSize( 240, 80 );
+        dialog.sizer = new Sizer( true );
+        dialog.sizer.add( label );
+        dialog.sizer.add( table );
+        dialog.sizer.add( text );
+        dialog.show();
+        processEvents();
+        var origin = dialog.localToGlobal( new Point( 0, 0 ) );
+        var at = function( control )
+        {
+           var corner = control.localToGlobal( new Point( 0, 0 ) );
+           var hit = dialog.childByPos( corner.x - origin.x + ( control.width >> 1 ), corner.y - origin.y + ( control.height >> 1 ) );
+           return hit === control ? "itself" : hit == null ? "nothing" : "another";
+        };
+        var result = [ at( label ), at( table ), at( text ) ];
+        dialog.hide();
+        result`);
+      expect(found).toEqual(['itself', 'nothing', 'nothing']);
+    });
+
+    it('reads what a file says about how it was taken, as the file holds it', async () => {
+      type Metadata = {
+        view: string;
+        keywords: Array<{ name: string; value: string | number | boolean; comment?: string }>;
+        properties: Array<{ id: string; value: string | number | boolean }>;
+        textLines?: number;
+        otherProperties?: number;
+      };
+      const dir = await mkdtemp(join(tmpdir(), 'mcp-live-metadata-'));
+      const path = join(dir, 'frame.xisf');
+      try {
+        await newImage('mcp_meta', 0.1, 48, 32, 1);
+        await inPixInsight(`
+          var window = ImageWindow.windowById( "mcp_meta" );
+          window.keywords = [
+             new FITSKeyword( "FILTER", "'Ha'", "Filter name" ),
+             new FITSKeyword( "INSTRUME", "'A camera with a long name'", "" ),
+             new FITSKeyword( "GAIN", "100", "Sensor gain" ),
+             new FITSKeyword( "OFFSET", "400", "" ),
+             new FITSKeyword( "EXPTIME", "300.5", "[s] Exposure" ),
+             new FITSKeyword( "COOLED", "T", "" ),
+             new FITSKeyword( "GUIDED", "F", "" ),
+             new FITSKeyword( "SLOT", "'7'", "A text that looks like a number" ),
+             new FITSKeyword( "HISTORY", "", "Calibrated by a test" ),
+             new FITSKeyword( "COMMENT", "", "A line of text" )
+          ];
+          window.mainView.setPropertyValue( "Instrument:Telescope:FocalLength", 0.75, PropertyType.Float64, PropertyAttribute.Storable | PropertyAttribute.Permanent );
+          window.mainView.setPropertyValue( "Instrument:Filter:Name", "Ha", PropertyType.String, PropertyAttribute.Storable | PropertyAttribute.Permanent );
+          window.mainView.setPropertyValue( "MCP:Table", new Vector( [ 1, 2, 3 ] ), PropertyType.F64Vector, PropertyAttribute.Storable | PropertyAttribute.Permanent );
+          true`);
+        // Through a file, so that this is what PixInsight stores and reads back, not what the test put there.
+        await run(live.session, 'save_image', { view: 'mcp_meta', path });
+        await close('mcp_meta');
+        await run(live.session, 'open_image', { path, id: 'mcp_meta_back' });
+
+        const all = await run<Metadata>(live.session, 'image_metadata', { view: 'mcp_meta_back' });
+        const keyword = (name: string) => all.keywords.find((each) => each.name === name);
+        // A text without its quotes, a number as a number, and a flag as true or false.
+        expect(keyword('FILTER')).toEqual({ name: 'FILTER', value: 'Ha', comment: 'Filter name' });
+        expect(keyword('INSTRUME')).toEqual({ name: 'INSTRUME', value: 'A camera with a long name' });
+        expect(keyword('GAIN')).toEqual({ name: 'GAIN', value: 100, comment: 'Sensor gain' });
+        expect(keyword('OFFSET')).toEqual({ name: 'OFFSET', value: 400 });
+        expect(keyword('EXPTIME')).toMatchObject({ value: 300.5 });
+        expect(keyword('COOLED')).toMatchObject({ value: true });
+        expect(keyword('GUIDED')).toMatchObject({ value: false });
+        // What stands in quotes is a text, whatever it looks like.
+        expect(keyword('SLOT')).toEqual({ name: 'SLOT', value: '7', comment: 'A text that looks like a number' });
+        // Lines of text are counted, not listed, until they are asked for.
+        expect(keyword('HISTORY')).toBeUndefined();
+        expect(all.textLines).toBeGreaterThanOrEqual(2);
+        expect(all.properties).toEqual(expect.arrayContaining([{ id: 'Instrument:Telescope:FocalLength', value: 0.75 }, { id: 'Instrument:Filter:Name', value: 'Ha' }]));
+        // What holds a table says nothing in one line.
+        expect(all.properties.some((property) => property.id === 'MCP:Table')).toBe(false);
+        expect(all.otherProperties).toBeGreaterThanOrEqual(1);
+
+        const some = await run<Metadata>(live.session, 'image_metadata', { view: 'mcp_meta_back', search: 'FILT' });
+        expect(some.keywords.map((each) => each.name)).toEqual(['FILTER']);
+        expect(some.properties.map((property) => property.id)).toEqual(['Instrument:Filter:Name']);
+        const lines = await run<Metadata>(live.session, 'image_metadata', { view: 'mcp_meta_back', search: 'history' });
+        expect(lines.keywords).toEqual([{ name: 'HISTORY', value: '', comment: 'Calibrated by a test' }]);
+        expect((await failing('image_metadata', { view: 'mcp_no_such_image' })).error?.kind).toBe('unknown_view');
+      } finally {
+        await close('mcp_meta_back').catch(() => undefined);
+        await close('mcp_meta').catch(() => undefined);
+        await rm(dir, { recursive: true, force: true });
+      }
     });
 
     it('measures a region without any intermediate images', async () => {
@@ -1308,9 +1407,12 @@ describe.skipIf(!existsSync(EXECUTABLE))('against a real PixInsight', { timeout:
 
   describe('instance loss', () => {
     it('leaves its instance running at the end if it holds unsaved work, and stops it once that is gone', async () => {
+      // Not those that an earlier run left behind, whose instance was ended from outside.
+      const inSwap = async () => (await readdir(tmpdir())).filter((name) => /^~PI~.*~mcp_stop/.test(name));
+      const old = new Set(await inSwap());
+      const swapFiles = async () => (await inSwap()).filter((name) => !old.has(name));
       await newImage('mcp_stop');
       await runProcess({ processId: 'PixelMath', view: 'mcp_stop', params: pixelMath('0.5') });
-      const swapFiles = async () => (await readdir(tmpdir())).filter((name) => /^~PI~.*~mcp_stop/.test(name));
       expect((await swapFiles()).length).toBeGreaterThan(0);
       const onSlot = async () => (await live.session.instances())?.find((instance) => instance.slot === live.config.workerSlot && !instance.crashed);
       const { pid } = (await onSlot())!;

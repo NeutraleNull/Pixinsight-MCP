@@ -68,6 +68,14 @@ export class SlotLeases {
     });
   }
 
+  /**
+   * The instance that the lease of a slot names, whichever server wrote it. An instance that
+   * outlives its server, as a preprocessing run does, has its slot until it has ended.
+   */
+  async instanceOn(slot: number): Promise<number | null> {
+    return (await this.read(slot))?.instance ?? null;
+  }
+
   /** The slots with an instance of some server, running or left behind by one that is gone. */
   async slots(): Promise<number[]> {
     const names = await readdir(this.dir).catch(() => []);

@@ -2,10 +2,10 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EnumCheckInconclusive, EnumGuard } from '../../src/bridge/enumGuard.js';
-import { ManagedInstance } from '../../src/bridge/instance.js';
-import { JobManager } from '../../src/bridge/jobs.js';
-import { FakePixInsight, failJob, makePaths, waitUntil, type Script } from './fakes.js';
+import { EnumCheckInconclusive, EnumGuard } from '../../../src/bridge/enumGuard.js';
+import { ManagedInstance } from '../../../src/bridge/instance.js';
+import { JobManager } from '../../../src/bridge/jobs.js';
+import { FakePixInsight, failJob, makePaths, waitUntil, type Script } from '../fakes.js';
 
 describe('EnumGuard', () => {
   let home: string;

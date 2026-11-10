@@ -3,8 +3,8 @@ import { mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ManagedInstance, type ManagedInstancePaths } from '../../src/bridge/instance.js';
-import { FakePixInsight, makePaths, waitUntil } from './fakes.js';
+import { ManagedInstance, type ManagedInstancePaths } from '../../../src/bridge/instance.js';
+import { FakePixInsight, makePaths, waitUntil } from '../fakes.js';
 
 /** A pid no process has, for a server that has gone away. Only ever tested with signal 0. */
 const DEAD_SERVER = 2 ** 31 - 2;

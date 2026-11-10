@@ -8,7 +8,7 @@ import type { Config } from '../../src/config.js';
 import type { LibraryDir } from '../../src/guides.js';
 import { Session } from '../../src/session.js';
 import { createServer } from '../../src/tools.js';
-import { FakePixInsight, sleep, waitUntil, writeResult, type Script } from './fakes.js';
+import { FakePixInsight, pix, FORM_FIELDS, playForm, playScript, sleep, waitUntil, writeResult, type Script } from './fakes.js';
 
 type Result = { content: Array<{ type: string; text?: string; data?: string }>; isError?: boolean };
 
@@ -40,7 +40,7 @@ describe('the tools, as a client sees them', () => {
   /** A server with a client, as one session of an MCP host. */
   const connect = async (config: Partial<Config> = {}, library?: LibraryDir[]) => {
     const ownSession = await Session.create(
-      { executable: '/nowhere', mode: 'shared', slot: undefined, workerSlot: 200, shadowSlot: 250, headless: true, home, allowedPrograms: [], guideDirs: [], scriptDirs: [], allowCode: false, ...config },
+      { executable: '/nowhere', mode: 'shared', slot: undefined, workerSlot: 200, shadowSlot: 250, preprocessSlot: 240, headless: true, home, allowedPrograms: [], guideDirs: [], scriptDirs: [], allowCode: false, scriptDialogs: 'off', ...config },
       cli,
     );
     const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
@@ -107,7 +107,11 @@ describe('the tools, as a client sees them', () => {
     };
 
     it('describes every tool with a schema that all of them accept', async () => {
-      const { tools: registered } = await client.listTools();
+      // With everything the user can turn on, so that no tool is left out.
+      const everything = await connect({ allowCode: true, scriptDialogs: 'operate' });
+      const { tools: registered } = await everything.client.listTools();
+      await everything.close();
+      expect(registered.map((tool) => tool.name)).toEqual(expect.arrayContaining(['run_code', 'start_script', 'get_script_dialog', 'use_script_dialog']));
       for (const tool of registered) {
         const { $schema: _dialect, ...schema } = tool.inputSchema as Record<string, unknown>;
         expect(schema['type'], tool.name).toBe('object');
@@ -147,6 +151,7 @@ describe('the tools, as a client sees them', () => {
       ['run_process', { processId: 'P', view: 'a', params: {}, waitMs: 500 }, 'run_process', { processId: 'P', view: 'a', params: {} }],
       ['list_images', {}, 'list_images', {}],
       ['get_image_stats', { view: 'a', rects: [rect], clipping: { low: 0.1 }, waitMs: 500 }, 'image_stats', { view: 'a', rects: [rect], clipping: { low: 0.1 } }],
+      ['get_image_metadata', { view: 'a', search: 'filt', waitMs: 500 }, 'image_metadata', { view: 'a', search: 'filt' }],
       ['get_preview', { view: 'a', maxSize: 256, crop: rect, stretchFrom: 'b', waitMs: 500 }, 'preview', { view: 'a', maxSize: 256, crop: rect, stretchFrom: 'b' }],
       ['undo', { view: 'a', count: 2, historyIndex: 3 }, 'undo', { view: 'a', count: 2, historyIndex: 3 }],
       ['redo', { view: 'a', historyIndex: 1 }, 'redo', { view: 'a', historyIndex: 1 }],
@@ -172,7 +177,7 @@ describe('the tools, as a client sees them', () => {
     it('is covered by the list above', async () => {
       const { tools: registered } = await client.listTools();
       // Without an operation of their own, or with more than one, which have tests of their own.
-      const notInTheList = ['get_job', 'cancel_job', 'get_guide', 'list_scripts', 'start_script'];
+      const notInTheList = ['get_job', 'cancel_job', 'get_guide', 'list_scripts', 'start_script', 'start_preprocessing'];
       expect(registered.map((tool) => tool.name).sort()).toEqual([...new Set(tools.map(([name]) => name)), ...notInTheList].sort());
     });
 
@@ -199,6 +204,106 @@ describe('the tools, as a client sees them', () => {
       await writeFile(join(home, 'shipped', 'Solver.js'), '#feature-id Solver : Astrometry > Solver\n#feature-info <b>Solves</b> the image.\n');
       await writeFile(join(home, 'shipped', 'Mount.js'), '#feature-id Mount : Instrumentation > Mount\n');
       cli.script = installation(changes);
+    });
+
+    describe('and preprocessing, which runs WBPP without its dialog', () => {
+      const frames = () => join(home, 'frames');
+      const out = () => join(home, 'out');
+      /** What WBPP leaves of a run that completed, as far as the result is read from it. */
+      const wbppCompletes = async (): Promise<void> => {
+        await mkdir(join(out(), 'logs'), { recursive: true });
+        await mkdir(join(out(), 'master'), { recursive: true });
+        await writeFile(join(out(), 'master', 'masterLight_FILTER-L.xisf'), 'x');
+        const log = join(out(), 'logs', '20261110185414.log');
+        await writeFile(log, ['* Begin integration of Light frames', 'Execution summary', '3 operation(s) completed, 0 failed, 0 canceled or not executed.', 'No frames have been excluded from the execution.', 'Smart report result'].map((line) => `[2026-11-10 18:54:14] ${line}`).join('\n'));
+        await writeFile(
+          join(out(), 'logs', '20261110185414_SmartReport.txt'),
+          '******************** LIGHT FRAMES CALIBRATION ********************\nGroup of 6 Light frames (6 active)\nFilter   : L\nKeywords : []\nMaster bias: /m/masterBias.xisf\nMaster dark: none\nMaster flat: none\n',
+        );
+        await writeFile(cli.runs.at(-1)!.outputPath, `:LOGFILE:${log}:LOGFILE:`);
+        cli.runs.at(-1)!.end(0);
+      };
+
+      beforeEach(async () => {
+        await writeFile(join(home, 'shipped', 'WBPP.js'), '#feature-id WeightedBatchPreprocessing : Batch Processing > WeightedBatchPreprocessing\n');
+        await mkdir(frames(), { recursive: true });
+      });
+
+      afterEach(() => {
+        for (const run of cli.runs) run.end(null);
+      });
+
+      it('starts a run, says how far it is, and reports it once it has ended, with a word on lights that got no flat', async () => {
+        const first = await call('start_preprocessing', { inputs: [frames()], outputDirectory: out(), keywords: ['SESSION'], options: { platesolve: false }, waitMs: 100 });
+        expect(first.isError).toBeUndefined();
+        const [pending] = blocks(first);
+        expect(pending).toEqual({ pending: true, jobId: expect.any(String), state: 'running', elapsedMs: expect.any(Number), hint: expect.stringMatching(/instance of its own.*get_job.*Do not start the run again/) });
+        expect(cli.runs[0]!.scripts[1]!.args).toEqual(['automationMode=true', `outputDirectory=${pix(out())}`, 'keywords=SESSION', 'platesolve=false', `dir=${pix(frames())}`]);
+        // The job tools know a run by its id.
+        expect(blocks(await call('get_job', { jobId: pending.jobId, waitMs: 100 }))[0]).toMatchObject({ pending: true, jobId: pending.jobId });
+        await wbppCompletes();
+        const done = await call('get_job', { jobId: pending.jobId, waitMs: 5000 });
+        expect(done.isError).toBeUndefined();
+        expect(blocks(done)[0]).toEqual({
+          outputDirectory: pix(out()),
+          summary: ['3 operation(s) completed, 0 failed, 0 canceled or not executed.', 'No frames have been excluded from the execution.'],
+          groups: [{ step: 'light frames calibration', frames: '6 Light frames (6 active)', filter: 'L', keywords: '[]', masterBias: 'masterBias.xisf', masterDark: 'none', masterFlat: 'none' }],
+          masters: [pix(join(out(), 'master', 'masterLight_FILTER-L.xisf'))],
+          log: join(out(), 'logs', '20261110185414.log'),
+          report: join(out(), 'logs', '20261110185414_SmartReport.txt'),
+          seconds: expect.any(Number),
+          hint: expect.stringMatching(/^1 group\(s\) of lights got no flat: read groups\..*open_image/),
+        });
+        expect(blocks(await call('cancel_job', { jobId: pending.jobId }))[0]).toMatchObject({ error: 'already_finished' });
+      });
+
+      it('stops a run on request, which the server can do because the instance is its own', async () => {
+        const [pending] = blocks(await call('start_preprocessing', { inputs: [frames()], outputDirectory: out(), waitMs: 100 }));
+        const { pid } = cli.runs[0]!;
+        expect(blocks(await call('cancel_job', { jobId: pending.jobId }))[0]).toEqual({ cancelled: true, message: expect.stringMatching(/stopped.*still there/) });
+        expect(cli.ended).toEqual([pid]);
+        expect(cli.killed).toEqual([]);
+        const after = await call('get_job', { jobId: pending.jobId });
+        expect(after.isError).toBe(true);
+        expect(blocks(after)[0]).toMatchObject({ error: 'cancelled' });
+      });
+
+      it('says so when a run cannot be stopped, as a result and not as a failure of the protocol', async () => {
+        const [pending] = blocks(await call('start_preprocessing', { inputs: [frames()], outputDirectory: out(), waitMs: 100 }));
+        cli.refuseEndRun = 'kill EPERM';
+        const refused = await call('cancel_job', { jobId: pending.jobId });
+        expect(refused.isError).toBe(true);
+        expect(blocks(refused)[0]).toMatchObject({ error: 'cli_failed', message: expect.stringContaining('kill EPERM') });
+        expect(blocks(await call('get_job', { jobId: pending.jobId, waitMs: 50 }))[0]).toMatchObject({ pending: true });
+      });
+
+      it('shows a run that is under way in the status, which is where its id is found again', async () => {
+        expect(blocks(await call('get_status'))[0]).not.toHaveProperty('preprocessing');
+        const [pending] = blocks(await call('start_preprocessing', { inputs: [frames()], outputDirectory: out(), waitMs: 100 }));
+        const status = blocks(await call('get_status'))[0]!;
+        expect(status).toMatchObject({ preprocessing: { jobId: pending.jobId, state: 'running', elapsedMs: expect.any(Number) } });
+        // Its instance is marked as what it is, and not taken for a worker.
+        expect((status.instances as Array<{ slot: number; role?: string }>).find((instance) => instance.slot === cli.runs[0]!.slot)).toMatchObject({ role: 'preprocessing' });
+        cli.runs[0]!.end(1);
+        await waitUntil(async () => !('preprocessing' in blocks(await call('get_status'))[0]!));
+      });
+
+      it('starts no run for a call that was given up before it began', async () => {
+        const given = new AbortController();
+        given.abort();
+        await client.callTool({ name: 'start_preprocessing', arguments: { inputs: [frames()], outputDirectory: out() } }, { signal: given.signal }).catch(() => undefined);
+        // What the server made of it is seen in what it did not do.
+        await call('get_status');
+        expect(cli.runs).toEqual([]);
+      });
+
+      it('returns a refusal as a result the assistant can act on, and starts nothing', async () => {
+        const refused = await call('start_preprocessing', { inputs: [join(home, 'nothing')], outputDirectory: out() });
+        expect(refused.isError).toBe(true);
+        expect(blocks(refused)[0]).toMatchObject({ error: 'no_such_file' });
+        expect(blocks(await call('start_preprocessing', { inputs: [frames()], outputDirectory: out(), options: { pipelineScriptFile: '/x.js' } }))[0]).toMatchObject({ error: 'blocked_parameter' });
+        expect(cli.runs).toEqual([]);
+      });
     });
 
     it('lists them by name and menu, marks the blocked ones, and keeps their paths to itself', async () => {
@@ -293,6 +398,262 @@ describe('the tools, as a client sees them', () => {
     it('turns a refusal into a result the assistant can act on', async () => {
       expect(blocks(await call('start_script', { script: 'Mount' }))[0]).toMatchObject({ error: 'blocked_script' });
       expect(blocks(await call('start_script', { script: 'Solvr' }))[0]).toMatchObject({ error: 'unknown_script', message: expect.stringContaining('list_scripts') });
+    });
+
+    describe('whose dialog the assistant may read and work', () => {
+      let working: Awaited<ReturnType<typeof connect>>;
+      const use = async (name: string, args: Record<string, unknown> = {}) => (await working.client.callTool({ name, arguments: args })) as Result;
+
+      beforeEach(async () => {
+        working = await connect({ scriptDialogs: 'operate' });
+      });
+
+      afterEach(async () => {
+        cli.userScript = () => undefined;
+        await working.close();
+      });
+
+      it('is offered as far as the user has set it', async () => {
+        const names = async (config: Partial<Config>) => {
+          const each = await connect(config);
+          const found = (await each.client.listTools()).tools.map((tool) => tool.name).filter((name) => name.includes('script'));
+          await each.close();
+          return found.sort();
+        };
+        expect(await names({ scriptDialogs: 'off' })).toEqual(['list_scripts', 'start_script']);
+        expect(await names({ scriptDialogs: 'read' })).toEqual(['get_script_dialog', 'list_scripts', 'start_script']);
+        expect(await names({ scriptDialogs: 'operate' })).toEqual(['get_script_dialog', 'list_scripts', 'start_script', 'use_script_dialog']);
+        expect(await names({ scriptDialogs: 'operate', mode: 'worker' })).toEqual([]);
+      });
+
+      it('says in the tool what the user has allowed, so that the assistant does not send the user to a dialog it can work itself', async () => {
+        const description = async (config: Partial<Config>) => {
+          const each = await connect(config);
+          const found = (await each.client.listTools()).tools.find((tool) => tool.name === 'start_script')?.description;
+          await each.close();
+          return found;
+        };
+        expect(await description({ scriptDialogs: 'off' })).toMatch(/only the user can work/);
+        expect(await description({ scriptDialogs: 'read' })).toMatch(/the result describes it, and the user works it/);
+        expect(await description({ scriptDialogs: 'operate' })).toMatch(/work it with use_script_dialog/);
+      });
+
+      it('answers the start of a script with its dialog, without the places that only a picture gives meaning to', async () => {
+        playForm(cli);
+        const result = await use('start_script', { script: 'Solver' });
+        expect(result.isError).toBeUndefined();
+        const [shown] = blocks(result);
+        expect(shown).toEqual({
+          pending: true,
+          jobId: expect.any(String),
+          dialog: { title: 'Solver', size: [200, 80], fields: FORM_FIELDS.map(({ at: _at, ...field }) => field) },
+          // What a rule of the session says once is said again where it applies.
+          hint: expect.stringMatching(/use_script_dialog.*write, replace or delete files or start a program.*ask the user first.*Never enter a password or a license key/),
+        });
+        await use('use_script_dialog', { action: 'close' });
+      });
+
+      it('returns a picture of the dialog with where the fields lie in it, and the file for a client without eyes', async () => {
+        playForm(cli);
+        const [{ jobId }] = blocks(await use('start_script', { script: 'Solver' }));
+        const result = await use('get_script_dialog', { picture: true });
+        expect(result.content[0]).toEqual({ type: 'image', mimeType: 'image/png', data: Buffer.from('png').toString('base64') });
+        expect(blocks(result)[0]).toMatchObject({ dialog: { fields: FORM_FIELDS }, file: join(home, 'jobs', jobId, 'dialog-1.png') });
+        await use('use_script_dialog', { action: 'close' });
+      });
+
+      it('does one thing in the dialog and shows it afterwards, and reports like any job once the script has ended', async () => {
+        const taken: Array<Record<string, any>> = [];
+        playForm(cli, taken);
+        await use('start_script', { script: 'Solver', view: 'Ha' });
+        // Only what is different now, and of that field only what differs, without where it lies.
+        expect(blocks(await use('use_script_dialog', { action: 'set', field: 'f1', value: 'M 31' }))[0]).toEqual({
+          pending: true,
+          jobId: expect.any(String),
+          dialog: { title: 'Solver', changed: [{ id: 'f1', type: 'Edit', value: 'M 31' }], unchanged: 1 },
+          hint: expect.stringMatching(/Only what is different.*get_script_dialog shows all of it/),
+        });
+        expect(taken.at(-2)).toMatchObject({ act: 'set', field: 'f1', value: 'M 31' });
+        expect(blocks(await use('use_script_dialog', { action: 'click', x: 10, y: 12 }))[0]).toMatchObject({ dialog: { title: 'Solver', changed: [], unchanged: 2 }, hint: expect.stringMatching(/Nothing that the dialog lists is different/) });
+        // One field by itself, for a table or a text that the dialog shows only the start of.
+        expect(blocks(await use('get_script_dialog', { field: 'f1', from: 3 }))[0]).toEqual({ pending: true, jobId: expect.any(String), dialog: { title: 'Solver' }, field: { id: 'f1', type: 'Edit', value: 'M 31', from: 3 } });
+        // What cannot be meant together is refused, and nothing is asked of the script.
+        const asked = taken.length;
+        for (const args of [{ from: 3 }, { field: 'f1', picture: true }, { field: 'f1', until: 'OK' }]) {
+          const refused = await use('get_script_dialog', args);
+          expect(refused.isError).toBe(true);
+          expect(blocks(refused)[0]).toMatchObject({ error: 'invalid_value' });
+        }
+        expect(blocks(await use('get_script_dialog', { until: ' ' }))[0]).toMatchObject({ error: 'invalid_value' });
+        expect(taken).toHaveLength(asked);
+        expect(blocks(await use('get_script_dialog'))[0]).toMatchObject({ dialog: { fields: [{ id: 'f1', value: 'M 31' }, { id: 'f2' }] } });
+        // A wait for a field that does not come says so, and how to go on waiting.
+        expect(blocks(await use('get_script_dialog', { until: 'Finished', waitMs: 1000 }))[0]).toMatchObject({ pending: true, hint: expect.stringMatching(/does not show the field you wait for yet.*same until again, or without until to see what it shows/) });
+        expect(blocks(await use('get_script_dialog', { until: 'ok', waitMs: 1000 }))[0]).toMatchObject({ dialog: { title: 'Solver' } });
+
+        const refused = await use('use_script_dialog', { action: 'press', field: 'f9' });
+        expect(refused.isError).toBe(true);
+        expect(blocks(refused)[0]).toEqual({ error: 'unknown_field', message: 'The dialog has no field f9.' });
+
+        const [done] = blocks(await use('use_script_dialog', { action: 'press', field: 'f2' }));
+        expect(done).toMatchObject({ ...changes, log: ['Solving Ha', 'RMS error: 0.12 px'] });
+        // A look after the end returns the report once more, and an action says that the script has ended.
+        expect(blocks(await use('get_script_dialog'))[0]).toMatchObject(changes);
+        expect(blocks(await use('use_script_dialog', { action: 'close' }))[0]).toMatchObject({ error: 'no_script', message: expect.stringMatching(/has ended.*get_job/) });
+      });
+
+      it('says where to read on in a field that holds more, and which unchanged fields it compared only in part', async () => {
+        playScript(cli, async (hook) => {
+          await hook.say();
+          for (;;) {
+            const command = await hook.command();
+            const reply = (result: object) => hook.reply(command['id'], { ok: true, result });
+            if (command['act'] === 'close') {
+              await reply({ fired: [] });
+              return hook.say({ dialog: null, title: null });
+            }
+            if (command['act'] !== 'describe') await reply({ fired: [] });
+            else if (command['field'] === 'f1') await reply({ dialog: 'd1.1', title: 'Report', field: { id: 'f1', type: 'TextBox', value: 'x'.repeat(10), from: command['from'], more: 7 } });
+            else if (command['field'] === 'f2') {
+              await reply({ dialog: 'd1.1', title: 'Report', field: { id: 'f2', type: 'TreeBox', columns: ['n'], value: null, rows: [{ row: 3, cells: ['a'] }, { row: 4, cells: ['b'] }], totalRows: 7, from: 3, moreRows: 2 } });
+            } else {
+              await reply({ dialog: 'd1.1', title: 'Report', size: [200, 80], moreFields: 4, fields: [{ id: 'f1', type: 'TextBox', value: 'x…', more: 16 }, { id: 'f2', type: 'TreeBox', columns: ['n'], rows: [], value: null, moreRows: 7 }, { id: 'f3', type: 'Edit', value: '' }] });
+            }
+          }
+        });
+        await use('start_script', { script: 'Solver' });
+        // After the last character, and after the last row that is listed.
+        expect(blocks(await use('get_script_dialog', { field: 'f1', from: 5 }))[0]).toMatchObject({ field: { id: 'f1', more: 7 }, hint: 'There is more of this field. Read on with from: 15.' });
+        expect(blocks(await use('get_script_dialog', { field: 'f2', from: 3 }))[0]).toMatchObject({ field: { id: 'f2', moreRows: 2 }, hint: 'There is more of this field. Read on with from: 5.' });
+        expect(blocks(await use('use_script_dialog', { action: 'set', field: 'f3', value: 'y' }))[0]).toMatchObject({
+          dialog: { changed: [], unchanged: 3, listedInPart: ['f1', 'f2'], moreFields: 4 },
+          hint: expect.stringMatching(/Nothing that the dialog lists is different.*listedInPart.*only the part that the dialog lists was compared/),
+        });
+        await use('use_script_dialog', { action: 'close' });
+      });
+
+      it('passes on a question of the script with how to answer it, and keeps its number to itself', async () => {
+        playScript(cli, async (hook) => {
+          await hook.say({ dialog: null, title: null, question: { id: 7, kind: 'message', text: 'Replace the file?', buttons: ['yes', 'no'] } });
+          await hook.answerTo(7);
+          await hook.say({ dialog: null, title: null });
+        });
+        const [asked] = blocks(await use('start_script', { script: 'Solver' }));
+        expect(asked).toEqual({
+          pending: true,
+          jobId: expect.any(String),
+          question: { kind: 'message', text: 'Replace the file?', buttons: ['yes', 'no'] },
+          hint: expect.stringMatching(/action "answer": the name of one of its buttons.*ask the user first.*The user sees the question too/),
+        });
+        expect(blocks(await use('use_script_dialog', { action: 'answer', value: 'no' }))[0]).toMatchObject(changes);
+      });
+
+      it('says that the script shows nothing while it is at work, and where to look again', async () => {
+        let end: (() => void) | undefined;
+        playScript(cli, async (hook) => {
+          await hook.say({ dialog: null, title: null });
+          await new Promise<void>((resolve) => (end = resolve));
+        });
+        const [pending] = blocks(await use('start_script', { script: 'Solver', waitMs: 100 }));
+        expect(pending).toMatchObject({ pending: true, jobId: expect.any(String), hint: expect.stringMatching(/shows no dialog of its own right now.*get_script_dialog/) });
+        expect(pending.dialog).toBeUndefined();
+        // Another tool hears why it has to wait, and that the script can be looked at.
+        const [behind] = blocks(await use('open_image', { path: '/data/Ha.xisf', waitMs: 100 }));
+        expect(behind).toMatchObject({ pending: true, hint: expect.stringMatching(/waits behind a script.*get_script_dialog/) });
+        await waitUntil(() => end !== undefined);
+        end?.();
+        expect(blocks(await use('get_job', { jobId: pending.jobId }))[0]).toMatchObject(changes);
+      });
+
+      it('shows the dialog to whoever checks on the job, which says more than that the job is not done', async () => {
+        playForm(cli);
+        const [{ jobId }] = blocks(await use('start_script', { script: 'Solver' }));
+        expect(blocks(await use('get_job', { jobId }))[0]).toMatchObject({ pending: true, jobId, dialog: { title: 'Solver' } });
+        await use('use_script_dialog', { action: 'close' });
+        expect(blocks(await use('get_job', { jobId }))[0]).toMatchObject(changes);
+      });
+
+      it('tells apart a dialog that does not answer, an action that is still at work, and no dialog', async () => {
+        let end: (() => void) | undefined;
+        playScript(cli, async (hook) => {
+          await hook.say();
+          const first = await hook.command();
+          await hook.reply(first['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [200, 80], fields: FORM_FIELDS } });
+          // It takes the press and is busy with it from then on.
+          await hook.command();
+          await new Promise<void>((resolve) => (end = resolve));
+        });
+        const [{ jobId }] = blocks(await use('start_script', { script: 'Solver' }));
+        const [working] = blocks(await use('use_script_dialog', { action: 'press', field: 'f2', waitMs: 1000 }));
+        expect(working).toMatchObject({ pending: true, jobId, hint: expect.stringMatching(/still at work on what you just did/) });
+        const [silent] = blocks(await use('get_script_dialog', { waitMs: 1000 }));
+        expect(silent).toMatchObject({ pending: true, hint: expect.stringMatching(/dialog of the script is open, but the script is busy in it/) });
+        await waitUntil(() => end !== undefined);
+        end?.();
+      });
+
+      it('passes on what the assistant has to know besides, such as an action that was not carried out', async () => {
+        let closeIt: (() => void) | undefined;
+        playScript(cli, async (hook) => {
+          await hook.say();
+          const first = await hook.command();
+          await hook.reply(first['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [200, 80], fields: FORM_FIELDS } });
+          await new Promise<void>((resolve) => (closeIt = resolve));
+          await hook.say({ dialog: null, title: null });
+        });
+        const [{ jobId }] = blocks(await use('start_script', { script: 'Solver' }));
+        const acting = use('use_script_dialog', { action: 'set', field: 'f1', value: 'x' });
+        await waitUntil(() => readFile(join(home, 'jobs', jobId, 'dialog-cmd.json')).then(() => true, () => false));
+        closeIt?.();
+        expect(blocks(await acting)[0]).toMatchObject({ ...changes, notes: ['Your action (set f1) was not carried out, because the dialog closed first.'] });
+      });
+
+      it('takes no wait for a dialog that is too short for one to answer', async () => {
+        const { tools: registered } = await working.client.listTools();
+        for (const name of ['get_script_dialog', 'use_script_dialog']) {
+          const schema = registered.find((tool) => tool.name === name)?.inputSchema as unknown as { properties: { waitMs: { minimum: number } } };
+          expect(schema.properties.waitMs.minimum, name).toBe(1000);
+        }
+      });
+
+      it('only shows the dialog where the user allows no more, and says who works it', async () => {
+        const reading = await connect({ scriptDialogs: 'read' });
+        playForm(cli);
+        const [shown] = blocks((await reading.client.callTool({ name: 'start_script', arguments: { script: 'Solver' } })) as Result);
+        expect(shown).toMatchObject({ dialog: { title: 'Solver' }, hint: expect.stringMatching(/waits for the user to work it/) });
+        // The user closes it.
+        await writeFile(join(home, 'jobs', shown.jobId, 'dialog-cmd.json'), JSON.stringify({ act: 'close', id: 99 }));
+        await reading.session.jobs.wait(shown.jobId, 2000);
+        await reading.close();
+      });
+
+      it('starts a script without that access if asked to, and then waits for the user as before', async () => {
+        let close: (() => void) | undefined;
+        cli.userScript = () => new Promise<void>((resolve) => (close = resolve));
+        const [pending] = blocks(await use('start_script', { script: 'Solver', plain: true, waitMs: 100 }));
+        expect(pending).toMatchObject({ pending: true });
+        expect(pending.dialog).toBeUndefined();
+        await waitUntil(() => cli.started.length === 1);
+        expect(cli.started).toEqual([{ slot: 1, path: join(home, 'shipped', 'Solver.js') }]);
+        // The hint is for this script, whose dialog only the user can work, whatever the setting allows for others.
+        const [later] = blocks(await use('get_job', { jobId: pending.jobId, waitMs: 100 }));
+        expect(later.hint).toMatch(/a dialog that only the user can work here/);
+        expect(later.hint).not.toMatch(/get_script_dialog/);
+        const [behind] = blocks(await use('open_image', { path: '/data/Ha.xisf', waitMs: 100 }));
+        expect(behind.hint).toMatch(/waits behind a script.*when the user has finished its dialog/);
+        expect(behind.hint).not.toMatch(/get_script_dialog/);
+        expect(blocks(await use('get_script_dialog'))[0]).toMatchObject({ error: 'no_dialog_access' });
+        await waitUntil(() => close !== undefined);
+        close?.();
+        await working.session.jobs.wait(pending.jobId, 2000);
+      });
+
+      it('tells how to end a script that cannot be cancelled from outside', async () => {
+        playForm(cli);
+        const [{ jobId }] = blocks(await use('start_script', { script: 'Solver' }));
+        expect(blocks(await use('cancel_job', { jobId }))[0]).toMatchObject({ error: 'already_running', message: expect.stringMatching(/use_script_dialog and action "close"/) });
+        await use('use_script_dialog', { action: 'close' });
+      });
     });
 
     it('is not offered in an instance without a window, where a dialog would block for good', async () => {

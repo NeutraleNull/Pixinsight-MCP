@@ -1,13 +1,15 @@
 import { cp, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { shadowSlots, type Config } from '../../src/config.js';
+import { preprocessSlots, shadowSlots, type Config } from '../../src/config.js';
 import { defaultExecutable } from '../../src/platform.js';
 import { Session } from '../../src/session.js';
 
 // Not the slots a server uses by default, so that a run of these tests cannot meet a server at work.
 export const WORKER_SLOT = Number(process.env['PIXINSIGHT_TEST_SLOT'] ?? 230);
 export const SHADOW_SLOT = WORKER_SLOT + 1;
+/** Behind every slot that the tests put a shadow instance on. */
+export const PREPROCESS_SLOT = WORKER_SLOT + 14;
 export const EXECUTABLE = process.env['PIXINSIGHT_EXECUTABLE'] ?? defaultExecutable();
 
 /** PixInsight leaves one small settings file per slot. These tests clean up after themselves. */
@@ -28,7 +30,7 @@ export async function removeFilesOfSlots(slots: readonly number[], startedAt: nu
 
 /** The slots a session in these tests can put an instance on. */
 export function slotsOf(config: Config): number[] {
-  return [config.workerSlot, ...shadowSlots(config)];
+  return [config.workerSlot, ...shadowSlots(config), ...preprocessSlots(config)];
 }
 
 /**
@@ -66,12 +68,14 @@ export async function startLiveSession(overrides: Partial<Config> = {}, testOps:
     slot: undefined,
     workerSlot: WORKER_SLOT,
     shadowSlot: SHADOW_SLOT,
+    preprocessSlot: PREPROCESS_SLOT,
     headless: true,
     home,
     allowedPrograms: [],
     guideDirs: [],
     scriptDirs: [],
     allowCode: false,
+    scriptDialogs: 'operate',
     ...overrides,
   };
   const session = await Session.create(config, undefined, source);

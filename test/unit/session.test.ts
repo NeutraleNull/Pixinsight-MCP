@@ -1,13 +1,14 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Config } from '../../src/config.js';
-import { Session, type ProcessInfo } from '../../src/session.js';
-import { FakePixInsight, failJob, isRunning, sleep, waitUntil, type Script } from './fakes.js';
+import { Session, type ProcessInfo, type ScriptView } from '../../src/session.js';
+import { pix, FakePixInsight, FORM_FIELDS, failJob, isRunning, playForm, playScript, sleep, waitUntil, type HookPart, type Script } from './fakes.js';
 
 const USER = 1;
 const SHADOW = 250;
+const PREPROCESS = 240;
 
 const PROCESSES: Record<string, Partial<ProcessInfo>> = {
   PixelMath: {
@@ -51,10 +52,11 @@ describe('Session', () => {
     slot: undefined,
     workerSlot: 200,
     shadowSlot: SHADOW,
+    preprocessSlot: PREPROCESS,
     headless: true,
     home,
     allowedPrograms: ['/opt/GraXpert'],
-    guideDirs: [], scriptDirs: [], allowCode: false,
+    guideDirs: [], scriptDirs: [], allowCode: false, scriptDialogs: 'off',
     ...overrides,
   });
 
@@ -387,7 +389,8 @@ describe('Session', () => {
       expect(done).toMatchObject({ state: 'succeeded', op: 'start_script' });
       expect(cli.commands).toEqual(['runner.js', 'runner.js', 'begin_log.js', 'Solver.js', 'runner.js']);
       expect(runOps()).toEqual(['prepare_script', 'start_script']);
-      expect(cli.ran.find((job) => job.op === 'prepare_script')?.args).toEqual({ view: 'Ha' });
+      // With the file, whose signature PixInsight checks before the script may start.
+      expect(cli.ran.find((job) => job.op === 'prepare_script')?.args).toEqual({ view: 'Ha', script: join(shipped, 'Solver.js') });
       expect(cli.started).toEqual([{ slot: USER, path: join(shipped, 'Solver.js') }]);
       // The image comes to the front once more right before the script, in case the user clicked elsewhere.
       expect(cli.logs).toEqual([{ file: join(home, 'jobs', done.id, 'script.log'), view: 'Ha' }]);
@@ -412,6 +415,13 @@ describe('Session', () => {
       expect(await session.jobs.wait(job.id, 2000)).toMatchObject({ state: 'succeeded' });
       expect(cli.ran.at(-1)?.args).toMatchObject({ startedOn: 'Oiii' });
       expect((await start({ script: 'Solver' })).state).toBe('succeeded');
+    });
+
+    it('starts nothing if PixInsight finds that the script does not match its signature', async () => {
+      const prepare = cli.script;
+      cli.script = (job, dir, pixinsight) => (job.op === 'prepare_script' ? failJob(dir, 'bad_signature', 'The file of this script does not match its signature.') : prepare(job, dir, pixinsight));
+      expect((await start({ script: 'Solver' })).error?.kind).toBe('bad_signature');
+      expect(cli.started).toEqual([]);
     });
 
     it.each([
@@ -518,8 +528,805 @@ describe('Session', () => {
       await worker.close();
     });
 
+    describe('preprocessing with WBPP in its automation mode', () => {
+      let frames: string;
+      let out: string;
+      const refusal = (request: Parameters<Session['startPreprocessing']>[0], platform?: NodeJS.Platform) =>
+        session.startPreprocessing(request, platform).then(
+          () => ({ kind: 'not refused', message: '' }),
+          (error: { kind?: string; message: string }) => ({ kind: error.kind ?? 'no kind', message: error.message }),
+        );
+
+      beforeEach(async () => {
+        await feature(shipped, 'WBPP.js', 'WeightedBatchPreprocessing : Batch Processing > WeightedBatchPreprocessing');
+        frames = join(home, 'frames');
+        out = join(home, 'out');
+        await mkdir(join(frames, 'session 1'), { recursive: true });
+        await writeFile(join(frames, 'master bias.xisf'), 'x');
+      });
+
+      afterEach(() => {
+        for (const run of cli.runs) run.end(null);
+      });
+
+      it('puts folders, files, keywords and options onto the command line of an instance of its own, and nothing onto that of the user', async () => {
+        const run = await session.startPreprocessing({
+          inputs: [`${join(frames, 'session 1')}/`, join(frames, 'master bias.xisf')],
+          outputDirectory: out,
+          keywords: ['SESSION', ' PANEL post '],
+          options: { platesolve: false, minWeight: 0.1, 'frameSelection.FWHM.enabled': true, referenceImage: join(frames, 'master bias.xisf') },
+        });
+        expect(run).toMatchObject({ op: 'preprocess', state: 'running', slot: PREPROCESS });
+        expect(cli.runs).toHaveLength(1);
+        // A folder is read as a whole, a file as one frame. A keyword each, because their own separator means something on a command line.
+        expect(cli.runs[0]!.scripts[1]).toEqual({
+          path: join(shipped, 'WBPP.js'),
+          args: [
+            'automationMode=true',
+            `outputDirectory=${pix(out)}`,
+            'keywords=SESSION',
+            'keywords=PANEL post',
+            'platesolve=false',
+            'minWeight=0.1',
+            'frameSelection.FWHM.enabled=true',
+            `referenceImage=${join(frames, 'master bias.xisf')}`,
+            `dir=${pix(join(frames, 'session 1'))}`,
+            `file=${pix(join(frames, 'master bias.xisf'))}`,
+          ],
+        });
+        // Nothing went to the instance the user works in, apart from the question where its scripts are.
+        expect(cli.started).toEqual([]);
+        expect(runOps()).toEqual([]);
+      });
+
+      it('refuses what would mean something else on a command line, or lead somewhere else', async () => {
+        const fine = { inputs: [frames], outputDirectory: out };
+        expect(await refusal({ ...fine, inputs: ['frames'] })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/absolute paths, with nothing around them, not "frames"/) });
+        expect(await refusal({ ...fine, inputs: [join(home, 'nothing')] })).toMatchObject({ kind: 'no_such_file' });
+        expect(await refusal({ ...fine, outputDirectory: 'out' })).toMatchObject({ kind: 'invalid_path' });
+        expect(await refusal({ ...fine, outputDirectory: join(frames, 'master bias.xisf') })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/is a file/) });
+        // WBPP reads a folder with everything below it, so its own output there would be input the next time.
+        expect(await refusal({ ...fine, outputDirectory: join(frames, 'out') })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/lies in the input folder/) });
+        expect(await refusal({ ...fine, outputDirectory: frames })).toMatchObject({ kind: 'invalid_path' });
+        // A character that means something on a command line: the answer names it, because no other spelling of the path helps.
+        expect(await refusal({ ...fine, outputDirectory: join(home, 'out,put') })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/The output folder .*out,put cannot go onto the command line of PixInsight, because "," has a meaning there/) });
+        await writeFile(join(frames, 'masterLight_(1).xisf'), 'x');
+        expect(await refusal({ ...fine, inputs: [join(frames, 'masterLight_(1).xisf')] })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/because "\(" has a meaning there\. Tell the user/) });
+        expect(await refusal({ ...fine, inputs: [] })).toMatchObject({ kind: 'invalid_value' });
+        expect(await refusal({ ...fine, inputs: [` ${frames}`] })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/nothing around them/) });
+        expect(await refusal({ ...fine, outputDirectory: `${out} ` })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/nothing around it/) });
+        for (const keyword of ['SESSION;PANEL', 'SESSION both', '', 'A,B', '$(x)']) expect(await refusal({ ...fine, keywords: [keyword] })).toMatchObject({ kind: 'invalid_value' });
+        expect(await refusal({ ...fine, options: { 'plate solve': true } })).toMatchObject({ kind: 'invalid_value' });
+        expect(await refusal({ ...fine, options: { platesolve: 'a,file=/etc/passwd' } })).toMatchObject({ kind: 'invalid_value' });
+        expect(await refusal({ ...fine, options: { minWeight: Number.NaN } })).toMatchObject({ kind: 'invalid_value' });
+        expect(await refusal({ ...fine, options: { rejection_4: { a: 1 } } })).toMatchObject({ kind: 'invalid_value' });
+        expect(cli.runs).toEqual([]);
+      });
+
+      it.skipIf(process.platform === 'win32')('refuses a backslash in a name elsewhere than on Windows, where the launcher of PixInsight would take it away', async () => {
+        await writeFile(join(home, 'a\\b.fits'), 'x');
+        expect(await refusal({ inputs: [join(home, 'a\\b.fits')], outputDirectory: out })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/because "\\\\" has a meaning there/) });
+        expect(cli.runs).toEqual([]);
+      });
+
+      it.skipIf(process.platform === 'win32')('follows a link to see where the output and the inputs really are', async () => {
+        await symlink(frames, join(home, 'link'));
+        expect(await refusal({ inputs: [frames], outputDirectory: join(home, 'link', 'out') })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/lies in the input folder/) });
+        expect(await refusal({ inputs: [join(home, 'link')], outputDirectory: join(frames, 'out') })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/lies in the input folder/) });
+        expect(cli.runs).toEqual([]);
+      });
+
+      it('sees through other spellings of a path that would put the output among the inputs, or the inputs into the output', async () => {
+        const fine = { inputs: [frames], outputDirectory: out };
+        const inside = /lies in the input folder/;
+        expect(await refusal({ ...fine, outputDirectory: `${home}/x/../frames/out` })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(inside) });
+        expect(await refusal({ ...fine, outputDirectory: `${home}//frames///out` })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(inside) });
+        // The other way round: a folder that the run writes into is no folder to read.
+        await mkdir(join(out, 'master'), { recursive: true });
+        await writeFile(join(out, 'master', 'masterFlat.xisf'), 'x');
+        expect(await refusal({ inputs: [frames, join(out, 'master')], outputDirectory: out })).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/lies in the output folder.*Name single files/) });
+        expect(cli.runs).toEqual([]);
+        // A single file from there is fine: a master of an earlier run.
+        expect((await session.startPreprocessing({ inputs: [frames, join(out, 'master', 'masterFlat.xisf')], outputDirectory: out })).state).toBe('running');
+        // What reaches PixInsight is the path without its detours.
+        expect(cli.runs[0]!.scripts[1]!.args).toContain(`outputDirectory=${pix(out)}`);
+      });
+
+      it('counts the command line in bytes, as the system does', async () => {
+        const long = join(home, 'ü'.repeat(120));
+        await mkdir(long);
+        await writeFile(join(long, 'frame.fits'), 'x');
+        // 420 paths of some 150 letters each fit by letters, and not by bytes.
+        expect(await refusal({ inputs: Array.from({ length: 420 }, () => join(long, 'frame.fits')), outputDirectory: out })).toMatchObject({ kind: 'invalid_value', message: expect.stringMatching(/bytes.*Name folders instead of single files/) });
+      });
+
+      it('names frames on Windows by drive or share, with either kind of slash', async () => {
+        const fine = { inputs: [frames], outputDirectory: out };
+        expect(await refusal({ ...fine, inputs: ['frames\\night 1'] }, 'win32')).toMatchObject({ kind: 'invalid_path', message: expect.stringMatching(/absolute paths/) });
+        // Read as paths of Windows, which this machine may not have: they get as far as the look for the folder.
+        expect(await refusal({ ...fine, inputs: ['C:\\astro\\night 1\\'] }, 'win32')).toMatchObject({ kind: 'no_such_file', message: expect.stringContaining('C:/astro/night 1.') });
+        // Not asked on Windows itself, where the look for a share that is not there takes its time.
+        if (process.platform !== 'win32') {
+          expect(await refusal({ ...fine, inputs: ['\\\\nas\\astro\\..\\astro\\night 1'] }, 'win32')).toMatchObject({ kind: 'no_such_file', message: expect.stringContaining('//nas/astro/night 1.') });
+        }
+      });
+
+      it('lets no option through that runs a script file or that the tool sets itself', async () => {
+        const fine = { inputs: [frames], outputDirectory: out };
+        for (const name of ['usePipelineScript', 'pipelineScriptFile', 'usePipelineBuilderScript', 'pipelineBuilderScriptFile']) {
+          expect(await refusal({ ...fine, options: { [name]: 'x' } })).toMatchObject({ kind: 'blocked_parameter', message: expect.stringMatching(/running code/) });
+        }
+        for (const name of ['automationMode', 'dir', 'file', 'keywords', 'outputDirectory', 'outputDir', 'testFile', 'loadOnly', 'recordTest', 'fileSearchRootPath', 'paramList', 'AUTOMATIONMODE', 'Dir']) {
+          expect(await refusal({ ...fine, options: { [name]: 'x' } })).toMatchObject({ kind: 'blocked_parameter' });
+        }
+        // WBPP compiles this one into a function.
+        expect(await refusal({ ...fine, options: { 'frameSelection.custom.formula': 'SNR/FWHM' } })).toMatchObject({ kind: 'blocked_parameter', message: expect.stringMatching(/evaluates its value as code/) });
+        expect(cli.runs).toEqual([]);
+      });
+
+      it('says so when the frames are too many to name one by one, where a folder would do', async () => {
+        const long = join(home, 'x'.repeat(200));
+        await mkdir(long);
+        await writeFile(join(long, 'frame.fits'), 'x');
+        expect(await refusal({ inputs: Array.from({ length: 480 }, () => join(long, 'frame.fits')), outputDirectory: out })).toMatchObject({ kind: 'invalid_value', message: expect.stringMatching(/Name folders instead of single files/) });
+      });
+
+      it('passes on why a run cannot begin: one is under way, or the script is not what the server listed', async () => {
+        const first = await session.startPreprocessing({ inputs: [frames], outputDirectory: out });
+        expect(await refusal({ inputs: [frames], outputDirectory: out })).toMatchObject({ kind: 'busy', message: expect.stringContaining(first.id) });
+        cli.runs[0]!.end(0);
+        await waitUntil(async () => (await session.preprocessing.get(first.id))?.done === true);
+        await writeFile(join(shipped, 'WBPP.js'), '// Changed after the server listed it.\n#feature-id WeightedBatchPreprocessing : Batch Processing > WeightedBatchPreprocessing\n');
+        expect(await refusal({ inputs: [frames], outputDirectory: out })).toMatchObject({ kind: 'script_changed' });
+      });
+    });
+
     it('cannot be made to start a script without these checks', () => {
       expect(() => session.jobs.submit('start_script', { script: 'Solver' })).toThrow(/must not be submitted without its check/);
+    });
+
+    describe('whose dialogs the assistant may read and work', () => {
+      let working: Session;
+      const look = { waitMs: 2000 };
+      const FIELDS = FORM_FIELDS;
+      const json = async (path: string): Promise<any> => JSON.parse(await readFile(path, 'utf8').catch(() => 'null'));
+      const playing = (part: (hook: HookPart) => Promise<void>) => playScript(cli, part);
+      const form = (taken: Array<Record<string, any>> = []) => playForm(cli, taken);
+      const kindOf = (view: ScriptView | null) => view?.kind;
+
+      beforeEach(async () => {
+        await writeFile(join(shipped, 'New.js'), '// Runs on the newer engine.\n#engine v8\n#feature-id New : Utilities > New\n');
+        working = await Session.create(config({ scriptDialogs: 'operate' }), cli);
+      });
+
+      afterEach(async () => {
+        cli.userScript = () => undefined;
+        await working.close();
+      });
+
+      it('sends a file of its own that runs the script from inside, and cleans up after a script of the older engine', async () => {
+        const done = await start({ script: 'Solver', view: 'Ha' }, working);
+        expect(done.state).toBe('succeeded');
+        const wrapper = join(home, 'jobs', done.id, 'start.js');
+        expect(cli.started).toEqual([{ slot: USER, path: wrapper }]);
+        expect(cli.commands.slice(-4)).toEqual(['begin_log.js', 'start.js', 'unhook.js', 'runner.js']);
+        const source = await readFile(wrapper, 'utf8');
+        expect(source.startsWith('( //')).toBe(true);
+        // With the folder of the job, leave to work the dialogs, and the engine, which the hook cannot tell by itself.
+        expect(source).toContain(`)( ${JSON.stringify(join(home, 'jobs', done.id))}, true, false );\n#include "${join(shipped, 'Solver.js')}"\n`);
+        // The hook is the one this server came with.
+        expect(source).toContain((await readFile(working.paths.dialogHookPath, 'utf8')).trimEnd());
+      });
+
+      it('runs that file on V8 where the script does, where nothing is left to clean up', async () => {
+        const done = await start({ script: 'New' }, working);
+        const source = await readFile(join(home, 'jobs', done.id, 'start.js'), 'utf8');
+        expect(source.split('\n')[0]).toBe('#engine v8');
+        expect(source).toContain(', true, true );\n#include');
+        expect(cli.commands.slice(-3)).toEqual(['begin_log.js', 'start.js', 'runner.js']);
+        expect(cli.unhooked).toBe(0);
+      });
+
+      it('starts a script as PixInsight does by itself if that is asked for, and then cannot look into it', async () => {
+        let close!: () => void;
+        cli.userScript = () => new Promise<void>((resolve) => (close = resolve));
+        const job = working.startScript({ script: 'Solver', plain: true });
+        expect(await working.watchScript(job.id, look)).toBeNull();
+        await waitUntil(() => cli.started.length === 1);
+        expect(cli.started).toEqual([{ slot: USER, path: join(shipped, 'Solver.js') }]);
+        await expect(working.scriptDialog(look)).rejects.toMatchObject({ kind: 'no_dialog_access' });
+        await expect(working.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'no_dialog_access' });
+        close();
+        expect((await working.jobs.wait(job.id, 2000)).state).toBe('succeeded');
+        expect(cli.unhooked).toBe(0);
+      });
+
+      it('shows the dialog as soon as the script does, and what one action after the other makes of it', async () => {
+        const taken: Array<Record<string, any>> = [];
+        form(taken);
+        const job = working.startScript({ script: 'Solver' });
+        const first = await working.watchScript(job.id, look);
+        expect(first).toMatchObject({ kind: 'dialog', job: { id: job.id, done: false }, dialog: { title: 'Solver', fields: FIELDS } });
+
+        expect(kindOf(await working.useScriptDialog({ action: 'set', field: 'f1', value: 'M 31' }, look))).toBe('dialog');
+        expect(kindOf(await working.useScriptDialog({ action: 'click', x: 10, y: 12 }, look))).toBe('dialog');
+        const again = await working.scriptDialog({ ...look, picture: true, help: true });
+        expect(again).toMatchObject({ kind: 'dialog', picture: join(home, 'jobs', job.id, 'dialog-1.png') });
+        expect(await readFile((again as { picture: string }).picture, 'utf8')).toBe('png');
+
+        // The button ends the script, so what comes back is the report of the job.
+        const end = await working.useScriptDialog({ action: 'press', field: 'f2' }, look);
+        expect(end).toMatchObject({ kind: 'done', job: { state: 'succeeded', op: 'start_script' } });
+        // Every action names the showing of the dialog it is meant for, and so does the picture.
+        expect(taken.map(({ id: _id, path: _path, ...command }) => command)).toEqual([
+          { act: 'describe', dialog: null, help: false },
+          { act: 'set', dialog: 'd1.1', field: 'f1', value: 'M 31' },
+          { act: 'describe', dialog: null, help: false },
+          { act: 'click', dialog: 'd1.1', x: 10, y: 12 },
+          { act: 'describe', dialog: null, help: false },
+          { act: 'describe', dialog: null, help: true },
+          { act: 'render', dialog: 'd1.1' },
+          { act: 'press', dialog: 'd1.1', field: 'f2' },
+        ]);
+      });
+
+      it('passes on what the script refuses, and what an action lacks', async () => {
+        form();
+        const job = working.startScript({ script: 'Solver' });
+        await working.watchScript(job.id, look);
+        await expect(working.useScriptDialog({ action: 'press', field: 'f9' }, look)).rejects.toMatchObject({ kind: 'unknown_field', message: 'The dialog has no field f9.' });
+        await expect(working.useScriptDialog({ action: 'set', field: 'f1' }, look)).rejects.toMatchObject({ kind: 'invalid_value' });
+        await expect(working.useScriptDialog({ action: 'press' }, look)).rejects.toMatchObject({ kind: 'invalid_value' });
+        await expect(working.useScriptDialog({ action: 'click', x: 3 }, look)).rejects.toMatchObject({ kind: 'invalid_value' });
+        await expect(working.useScriptDialog({ action: 'answer', value: 'yes' }, look)).rejects.toMatchObject({ kind: 'no_question' });
+        expect(kindOf(await working.useScriptDialog({ action: 'close' }, look))).toBe('done');
+        // Once the script has ended, a look returns its report, and an action says where that is.
+        expect(await working.scriptDialog(look)).toMatchObject({ kind: 'done', job: { id: job.id, state: 'succeeded' } });
+        await expect(working.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'no_script', message: expect.stringContaining(job.id) });
+      });
+
+      it('knows no script before one was started', async () => {
+        await expect(working.scriptDialog(look)).rejects.toMatchObject({ kind: 'no_script', message: expect.stringContaining('start_script') });
+        await expect(working.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'no_script' });
+      });
+
+      it('shows a question of the script, and gives the script the answer if it is one the question allows', async () => {
+        const answers: unknown[] = [];
+        playing(async (hook) => {
+          const question = { id: 1, kind: 'message', text: 'Replace the file?', buttons: ['yes', 'no'] };
+          await hook.say({ dialog: null, title: null, question });
+          answers.push(await hook.answerTo(1));
+          await hook.say({ dialog: null, title: null });
+        });
+        const job = working.startScript({ script: 'Solver' });
+        expect(await working.watchScript(job.id, look)).toMatchObject({ kind: 'question', question: { kind: 'message', text: 'Replace the file?', buttons: ['yes', 'no'] } });
+        // Nothing else can be done while the script waits for this.
+        await expect(working.useScriptDialog({ action: 'press', field: 'f2' }, look)).rejects.toMatchObject({ kind: 'question_open', message: expect.stringContaining('Replace the file?') });
+        await expect(working.useScriptDialog({ action: 'answer', value: 'maybe' }, look)).rejects.toMatchObject({ kind: 'invalid_value', message: expect.stringContaining('yes, no') });
+        await expect(working.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'question_open' });
+        expect(kindOf(await working.useScriptDialog({ action: 'answer', value: ' Yes ' }, look))).toBe('done');
+        expect(answers).toEqual(['yes']);
+      });
+
+      it('checks a path before the script gets it, and never lets a file be replaced on its own word', async () => {
+        const existing = join(home, 'existing.xisf');
+        await writeFile(existing, 'x');
+        const answers: unknown[] = [];
+        playing(async (hook) => {
+          const ask = async (id: number, question: object) => {
+            await hook.say({ dialog: null, title: null, question: { id, ...question } });
+            answers.push(await hook.answerTo(id));
+          };
+          await ask(1, { kind: 'open_file', caption: 'Open' });
+          await ask(2, { kind: 'save_file', caption: 'Save' });
+          await ask(3, { kind: 'directory', caption: 'Folder' });
+          await ask(4, { kind: 'open_file', caption: 'Open several', multiple: true });
+          await ask(5, { kind: 'save_file', caption: 'Save' });
+          await hook.say({ dialog: null, title: null });
+        });
+        const job = working.startScript({ script: 'Solver' });
+        const answer = (value: string | string[] | boolean, allowOverwrite?: boolean) => working.useScriptDialog({ action: 'answer', value, allowOverwrite }, look);
+        expect(kindOf(await working.watchScript(job.id, look))).toBe('question');
+
+        await expect(answer(join(home, 'missing.xisf'))).rejects.toMatchObject({ kind: 'no_such_file' });
+        await expect(answer('existing.xisf')).rejects.toMatchObject({ kind: 'invalid_path', message: expect.stringContaining('absolute') });
+        await expect(answer([existing, existing])).rejects.toMatchObject({ kind: 'invalid_value' });
+        await expect(answer(true)).rejects.toMatchObject({ kind: 'invalid_value' });
+        expect(await answer(existing)).toMatchObject({ kind: 'question', question: { kind: 'save_file' } });
+
+        await expect(answer(existing)).rejects.toMatchObject({ kind: 'file_exists', message: expect.stringContaining('allowOverwrite') });
+        await expect(answer(join(home, 'no-folder', 'new.xisf'))).rejects.toMatchObject({ kind: 'no_such_file' });
+        await expect(answer(home)).rejects.toMatchObject({ kind: 'invalid_path' });
+        expect(await answer(join(home, 'new.xisf'))).toMatchObject({ kind: 'question', question: { kind: 'directory' } });
+
+        await expect(answer(existing)).rejects.toMatchObject({ kind: 'no_such_file' });
+        expect(await answer(home)).toMatchObject({ kind: 'question', question: { multiple: true } });
+        expect(await answer([existing, existing])).toMatchObject({ kind: 'question', question: { kind: 'save_file' } });
+        expect(kindOf(await answer(existing, true))).toBe('done');
+        expect(answers).toEqual([existing, join(home, 'new.xisf'), home, [existing, existing], existing]);
+      });
+
+      it('cancels a file chooser by closing, and by the answer false', async () => {
+        const answers: unknown[] = [];
+        playing(async (hook) => {
+          for (const id of [1, 2]) {
+            await hook.say({ dialog: null, title: null, question: { id, kind: 'open_file', caption: 'Open' } });
+            answers.push(await hook.answerTo(id));
+          }
+          await hook.say({ dialog: null, title: null });
+        });
+        const job = working.startScript({ script: 'Solver' });
+        await working.watchScript(job.id, look);
+        expect(kindOf(await working.useScriptDialog({ action: 'close' }, look))).toBe('question');
+        expect(kindOf(await working.useScriptDialog({ action: 'answer', value: false }, look))).toBe('done');
+        expect(answers).toEqual([false, false]);
+      });
+
+      it('does not answer a question the user has answered in the meantime', async () => {
+        let answered!: () => void;
+        const taken: unknown[] = [];
+        playing(async (hook) => {
+          await hook.say({ dialog: null, title: null, question: { id: 1, kind: 'message', text: 'Go on?', buttons: ['ok'] } });
+          await new Promise<void>((resolve) => (answered = resolve));
+          await hook.say();
+          taken.push(await hook.command());
+        });
+        const job = working.startScript({ script: 'Solver' });
+        expect(kindOf(await working.watchScript(job.id, look))).toBe('question');
+        answered();
+        await waitUntil(async () => (await json(join(home, 'jobs', job.id, 'dialog-state-2.json'))) !== null);
+        await expect(working.useScriptDialog({ action: 'answer', value: 'ok' }, look)).rejects.toMatchObject({ kind: 'no_question' });
+        await expect(readFile(join(home, 'jobs', job.id, 'dialog-answer-1.json'))).rejects.toThrow();
+      });
+
+      it('says that nothing is shown while the script is at work, and takes back what nobody took', async () => {
+        let end: (() => void) | undefined;
+        playing(async (hook) => {
+          await hook.say({ dialog: null, title: null });
+          await new Promise<void>((resolve) => (end = resolve));
+        });
+        const job = working.startScript({ script: 'Solver' });
+        expect(await working.watchScript(job.id, { waitMs: 80 })).toMatchObject({ kind: 'none', job: { done: false } });
+        await expect(working.useScriptDialog({ action: 'press', field: 'f2' }, look)).rejects.toMatchObject({ kind: 'no_dialog' });
+        await expect(readFile(join(home, 'jobs', job.id, 'dialog-cmd.json'))).rejects.toThrow();
+        await waitUntil(() => end !== undefined);
+        end?.();
+        expect(kindOf(await working.scriptDialog(look))).toBe('done');
+      });
+
+      it('shows the dialog that a button opened in place of an answer to the press, which comes when that is closed', async () => {
+        playing(async (hook) => {
+          await hook.say();
+          const describe = async (title: string) => {
+            const command = await hook.command();
+            await hook.reply(command['id'], { ok: true, result: { dialog: title === 'Child' ? 'd2.1' : 'd1.1', title, size: [100, 50], fields: [] } });
+          };
+          await describe('Solver');
+          await hook.command();
+          await hook.say({ dialog: 'd2.1', title: 'Child' });
+          await describe('Child');
+          await hook.command();
+          await hook.say({ dialog: null, title: null });
+        });
+        const job = working.startScript({ script: 'Solver' });
+        await working.watchScript(job.id, look);
+        expect(await working.useScriptDialog({ action: 'press', field: 'f2' }, look)).toMatchObject({ kind: 'dialog', dialog: { title: 'Child' } });
+        expect(kindOf(await working.useScriptDialog({ action: 'close' }, look))).toBe('done');
+      });
+
+      describe('so that nothing is done to something the assistant has not seen', () => {
+        const exists = (job: { id: string }, file: string) => readFile(join(home, 'jobs', job.id, file)).then(() => true, () => false);
+        const describing = async (hook: HookPart, name = 'd1.1', title = 'Solver') => {
+          const command = await hook.command();
+          await hook.reply(command['id'], { ok: true, result: { dialog: name, title, size: [100, 50], fields: FIELDS } });
+        };
+
+        it('reads one field of the dialog it last showed in full, and no field of a dialog it has not shown', async () => {
+          const taken: Array<Record<string, any>> = [];
+          form(taken);
+          const job = working.startScript({ script: 'Solver' });
+          await waitUntil(() => exists(job, 'dialog-state-1.json'));
+          await expect(working.scriptField({ field: 'f1' }, look)).rejects.toMatchObject({ kind: 'dialog_changed', message: expect.stringMatching(/a dialog that you have not read yet.*get_script_dialog first, without a field/) });
+          expect(taken).toEqual([]);
+
+          await working.watchScript(job.id, look);
+          expect(await working.scriptField({ field: 'f1', from: 5 }, look)).toMatchObject({ kind: 'field', title: 'Solver', job: { id: job.id }, field: { id: 'f1', type: 'Edit', value: 'initial', from: 5 } });
+          // It is asked of the very dialog that was read, so that the name of a field cannot mean another one.
+          expect(taken.at(-1)).toMatchObject({ act: 'describe', dialog: 'd1.1', field: 'f1', from: 5, help: false });
+          await expect(working.scriptField({ field: 'f9' }, look)).rejects.toMatchObject({ kind: 'unknown_field' });
+          await working.useScriptDialog({ action: 'close' }, look);
+          expect(kindOf(await working.scriptField({ field: 'f1' }, look))).toBe('done');
+        });
+
+        it('waits for a field of the dialog it last showed, such as the button that ends a long run', async () => {
+          let looks = 0;
+          let finish: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] !== 'describe') {
+                await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+                return hook.say({ dialog: null, title: null });
+              }
+              // The run ends between the third look and the fourth. Until then its button is there, and greyed out.
+              const done = ++looks > 3;
+              if (looks === 3) finish?.();
+              await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Monitor', size: [200, 80], fields: [{ id: 'f1', type: 'PushButton', text: 'Cancel' }, { id: 'f2', type: 'PushButton', text: 'DONE', ...(done ? {} : { enabled: false }) }] } });
+            }
+          });
+          working.untilPollMs = 20;
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          expect(looks).toBe(1);
+          await expect(working.scriptDialog({ waitMs: 1000, until: '  ' })).rejects.toMatchObject({ kind: 'invalid_value' });
+          // A text that no field has is waited for in vain: no dialog comes back, only that it is not there yet.
+          expect(await working.scriptDialog({ waitMs: 1000, until: 'Finished' })).toMatchObject({ kind: 'none', why: 'not_yet', job: { id: job.id } });
+          const before = looks;
+          expect(before).toBeGreaterThan(2);
+          const shown = await working.scriptDialog({ waitMs: 5000, until: ' done ' });
+          expect(shown).toMatchObject({ kind: 'dialog', dialog: { title: 'Monitor', fields: [{ text: 'Cancel' }, { id: 'f2', text: 'DONE' }] } });
+          expect((shown as { dialog: { fields: Array<Record<string, unknown>> } }).dialog.fields[1]).not.toHaveProperty('enabled');
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('compares with what it last showed, not with what it only looked at while it waited or with what it refused', async () => {
+          let label = 'Step 1';
+          playing(async (hook) => {
+            await hook.say();
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] === 'describe') {
+                await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Monitor', size: [200, 80], fields: [{ id: 'f1', type: 'Label', text: label }, { id: 'f2', type: 'PushButton', text: 'Next' }] } });
+                // The script goes on by itself between two looks.
+                label = label === 'Step 1' ? 'Step 2' : 'Step 3';
+              } else if (command['field'] === 'f9') await hook.reply(command['id'], { ok: false, error: { kind: 'unknown_field', message: 'The dialog has no field f9.' } });
+              else if (command['act'] === 'close') {
+                await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+                return hook.say({ dialog: null, title: null });
+              } else await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+            }
+          });
+          working.untilPollMs = 20;
+          const job = working.startScript({ script: 'Solver' });
+          expect(await working.watchScript(job.id, look)).toMatchObject({ dialog: { fields: [{ text: 'Step 1' }, { text: 'Next' }] } });
+          // Several looks, none of which is shown. And an action that is refused shows nothing either.
+          expect(await working.scriptDialog({ waitMs: 1000, until: 'Finished' })).toMatchObject({ kind: 'none', why: 'not_yet' });
+          await expect(working.useScriptDialog({ action: 'press', field: 'f9' }, look)).rejects.toMatchObject({ kind: 'unknown_field' });
+          // So the next answer says what is different from the first description, however often the label changed meanwhile.
+          const view = await working.useScriptDialog({ action: 'press', field: 'f2' }, look);
+          expect(view).toMatchObject({ changes: { changed: [{ id: 'f1', type: 'Label', text: 'Step 3' }], unchanged: 1 } });
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('says that an action was carried out where it cannot show what came of it', async () => {
+          let described = 0;
+          playing(async (hook) => {
+            await hook.say();
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] === 'close') {
+                await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+                return hook.say({ dialog: null, title: null });
+              }
+              if (command['act'] !== 'describe') await hook.reply(command['id'], { ok: true, result: { fired: ['onClick'] } });
+              // The first look works. The one after the action fails in the script, and the one after that is never answered.
+              else if (++described === 1) await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [200, 80], fields: FIELDS } });
+              else if (described === 2) await hook.reply(command['id'], { ok: false, error: { kind: 'script_error', message: 'The dialog could not be described.' } });
+            }
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          await expect(working.useScriptDialog({ action: 'press', field: 'f2' }, look)).rejects.toMatchObject({
+            kind: 'script_error',
+            message: expect.stringMatching(/^Your action \(press f2\) was carried out, so do not repeat it\. But the dialog could not be read afterwards: The dialog could not be described\.$/),
+          });
+          expect(await working.useScriptDialog({ action: 'set', field: 'f1', value: 'x' }, { waitMs: 1000 })).toMatchObject({ kind: 'none', why: 'not_answering', notes: ['Your action (set f1) was carried out. Do not repeat it.'] });
+          cli.userScript = () => undefined;
+        });
+
+        it('says after an action only what is different in the dialog it last showed', async () => {
+          let fields: Array<Record<string, unknown>> = [
+            { id: 'f1', type: 'Edit', value: 'initial', at: [8, 8, 100, 20] },
+            { id: 'f2', type: 'PushButton', text: 'OK', at: [8, 40, 60, 20] },
+            { id: 'f3', type: 'CheckBox', text: 'Solve', value: false, enabled: false, at: [8, 70, 60, 20] },
+          ];
+          playing(async (hook) => {
+            await hook.say();
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] === 'describe') {
+                await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [200, 100], fields } });
+                continue;
+              }
+              if (command['act'] === 'close') {
+                await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+                return hook.say({ dialog: null, title: null });
+              }
+              // The first change enables a field, adds one and moves the button. The second takes the new field away again.
+              fields =
+                command['value'] === 'M 31'
+                  ? [{ ...fields[0], value: 'M 31' }, { ...fields[1], at: [8, 60, 60, 20] }, { id: 'f3', type: 'CheckBox', text: 'Solve', value: false, at: [8, 90, 60, 20] }, { id: 'f4', type: 'Label', text: 'Found in the catalog', at: [8, 40, 100, 14] }]
+                  : fields.slice(0, 3);
+              await hook.reply(command['id'], { ok: true, result: { fired: [] } });
+            }
+          });
+          const job = working.startScript({ script: 'Solver' });
+          expect(await working.watchScript(job.id, look)).not.toHaveProperty('changes');
+          const first = await working.useScriptDialog({ action: 'set', field: 'f1', value: 'M 31' }, look);
+          // Where a field lies is not what it shows, so a button that only moved has not changed.
+          expect(first).toMatchObject({
+            kind: 'dialog',
+            changes: {
+              added: [{ id: 'f4', type: 'Label', text: 'Found in the catalog' }],
+              changed: [{ id: 'f1', type: 'Edit', value: 'M 31' }, { id: 'f3', type: 'CheckBox', text: 'Solve', enabled: true }],
+              gone: [],
+              unchanged: 1,
+            },
+          });
+          expect((first as { changes: { changed: unknown[] } }).changes.changed[0]).toEqual({ id: 'f1', type: 'Edit', value: 'M 31' });
+          expect(await working.useScriptDialog({ action: 'set', field: 'f1', value: 'M 31 again' }, look)).toMatchObject({ changes: { added: [], changed: [], gone: ['f4'], unchanged: 3 } });
+          // A look shows all of it, and is what the next action is compared with.
+          expect(await working.scriptDialog(look)).not.toHaveProperty('changes');
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('does not act on a dialog that came up after the one it last read', async () => {
+          let change: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            await describing(hook);
+            await new Promise<void>((resolve) => (change = resolve));
+            // The user closed the dialog, and the script shows its next one.
+            await hook.say({ dialog: 'd2.1', title: 'Results' });
+            await describing(hook, 'd2.1', 'Results');
+            await hook.command();
+            await hook.say({ dialog: null, title: null });
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          change?.();
+          await waitUntil(async () => (await json(join(home, 'jobs', job.id, 'dialog-state-2.json'))) !== null);
+          await expect(working.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'dialog_changed', message: expect.stringContaining('"Results"') });
+          expect(await exists(job, 'dialog-cmd.json')).toBe(false);
+          // Once it has read the new one, it can.
+          expect(await working.scriptDialog(look)).toMatchObject({ kind: 'dialog', dialog: { title: 'Results' } });
+          expect(kindOf(await working.useScriptDialog({ action: 'close' }, look))).toBe('done');
+        });
+
+        it('does not answer a question that took the place of the one it was shown', async () => {
+          const answers: unknown[] = [];
+          let next: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say({ dialog: null, title: null, question: { id: 1, kind: 'message', text: 'Replace A?', buttons: ['yes', 'no'] } });
+            await new Promise<void>((resolve) => (next = resolve));
+            // The user answered the first one in PixInsight, and the script asks the next.
+            await hook.say({ dialog: null, title: null, question: { id: 2, kind: 'message', text: 'Replace B?', buttons: ['yes', 'no'] } });
+            answers.push(await hook.answerTo(2));
+            await hook.say({ dialog: null, title: null });
+          });
+          const job = working.startScript({ script: 'Solver' });
+          expect(await working.watchScript(job.id, look)).toMatchObject({ kind: 'question', question: { text: 'Replace A?' } });
+          next?.();
+          await waitUntil(async () => (await json(join(home, 'jobs', job.id, 'dialog-state-2.json'))) !== null);
+          await expect(working.useScriptDialog({ action: 'answer', value: 'yes' }, look)).rejects.toMatchObject({ kind: 'question_changed', message: expect.stringContaining('Replace B?') });
+          expect(await exists(job, 'dialog-answer-2.json')).toBe(false);
+          // The refusal has shown it the new question, so now the answer is for that one.
+          expect(kindOf(await working.useScriptDialog({ action: 'answer', value: 'no' }, look))).toBe('done');
+          expect(answers).toEqual(['no']);
+        });
+
+        it('takes back an action that the dialog does not take in time, and says that nothing was done', async () => {
+          let end: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            await describing(hook);
+            // Busy in a handler: the dialog is there and takes nothing.
+            await new Promise<void>((resolve) => (end = resolve));
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          await expect(working.useScriptDialog({ action: 'press', field: 'f2' }, { waitMs: 0 })).rejects.toMatchObject({ kind: 'not_taken', message: expect.stringMatching(/press f2.*nothing was done/) });
+          expect(await exists(job, 'dialog-cmd.json')).toBe(false);
+          // A look says that a dialog is there and does not answer, which is not the same as none.
+          expect(await working.scriptDialog({ waitMs: 0 })).toMatchObject({ kind: 'none', why: 'not_answering' });
+          end?.();
+        });
+
+        it('says that the script is still at work on an action it took, and later what became of it', async () => {
+          let finish: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            await describing(hook);
+            const pressed = await hook.command();
+            // The button asks before it goes on, and what it then does fails.
+            await hook.say({ question: { id: 1, kind: 'message', text: 'Overwrite?', buttons: ['yes', 'no'] } });
+            await hook.answerTo(1);
+            await hook.say();
+            await new Promise<void>((resolve) => (finish = resolve));
+            await hook.reply(pressed['id'], { ok: false, error: { kind: 'script_error', message: 'The script failed while it handled this (onClick): disk full' } });
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] !== 'describe') return hook.say({ dialog: null, title: null });
+              await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [100, 50], fields: FIELDS } });
+            }
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          expect(kindOf(await working.useScriptDialog({ action: 'press', field: 'f2' }, look))).toBe('question');
+          // The dialog is back, and the press that asked has not come to its end.
+          await expect(working.useScriptDialog({ action: 'answer', value: 'yes' }, { waitMs: 0 })).resolves.toMatchObject({ kind: 'none', why: 'not_answering' });
+          finish?.();
+          const after = await working.scriptDialog(look);
+          expect(after).toMatchObject({ kind: 'dialog', notes: [expect.stringMatching(/earlier action \(press f2\) failed.*disk full/)] });
+          // Told once.
+          expect((await working.scriptDialog(look)).notes).toBeUndefined();
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('says so when an action was not carried out because the dialog closed first', async () => {
+          let closeIt: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            await describing(hook);
+            await new Promise<void>((resolve) => (closeIt = resolve));
+            // The user closes the dialog while the action is on its way, and the script ends.
+            await hook.say({ dialog: null, title: null });
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          const acting = working.useScriptDialog({ action: 'set', field: 'f1', value: 'x' }, look);
+          await waitUntil(() => exists(job, 'dialog-cmd.json'));
+          closeIt?.();
+          expect(await acting).toMatchObject({ kind: 'done', notes: ['Your action (set f1) was not carried out, because the dialog closed first.'] });
+        });
+
+        it('says so when another dialog came up before an action was taken, and shows that dialog', async () => {
+          let change: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            await describing(hook);
+            await new Promise<void>((resolve) => (change = resolve));
+            await hook.say({ dialog: 'd2.1', title: 'Another' });
+            // The server takes back what it sent for the first dialog. Then the new one is looked at.
+            await waitUntil(async () => (await json(join(hook.dir, 'dialog-cmd.json')))?.act === 'describe');
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] === 'describe') await hook.reply(command['id'], { ok: true, result: { dialog: 'd2.1', title: 'Another', size: [100, 50], fields: [] } });
+              else return hook.say({ dialog: null, title: null });
+            }
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          const acting = working.useScriptDialog({ action: 'press', field: 'f2' }, look);
+          await waitUntil(() => exists(job, 'dialog-cmd.json'));
+          change?.();
+          const view = await acting;
+          expect(view).toMatchObject({
+            kind: 'dialog',
+            dialog: { title: 'Another' },
+            notes: ['Your action (press f2) was not carried out, because the script showed this dialog first.', expect.stringMatching(/another dialog now.*Only the field ids of this description apply/)],
+          });
+          // A dialog that is new comes in full.
+          expect(view).not.toHaveProperty('changes');
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('reports what the script cannot describe, instead of saying that it shows nothing', async () => {
+          let end: (() => void) | undefined;
+          playing(async (hook) => {
+            await hook.say();
+            const command = await hook.command();
+            await hook.reply(command['id'], { ok: false, error: { kind: 'script_error', message: 'The dialog could not be read.' } });
+            await new Promise<void>((resolve) => (end = resolve));
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await expect(working.watchScript(job.id, look)).rejects.toMatchObject({ kind: 'script_error', message: 'The dialog could not be read.' });
+          end?.();
+        });
+
+        it('returns the dialog without a picture, and says why, if none could be taken', async () => {
+          playing(async (hook) => {
+            await hook.say();
+            for (;;) {
+              const command = await hook.command();
+              if (command['act'] === 'describe') await hook.reply(command['id'], { ok: true, result: { dialog: 'd1.1', title: 'Solver', size: [100, 50], fields: FIELDS } });
+              else if (command['act'] === 'render') await hook.reply(command['id'], { ok: false, error: { kind: 'dialog_changed', message: 'The script shows something else now.' } });
+              else return hook.say({ dialog: null, title: null });
+            }
+          });
+          const job = working.startScript({ script: 'Solver' });
+          const shown = await working.watchScript(job.id, { ...look, picture: true });
+          expect(shown).toMatchObject({ kind: 'dialog', notes: ['No picture: The script shows something else now.'] });
+          expect((shown as { picture?: string }).picture).toBeUndefined();
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it('waits as long as a dialog needs to answer, however short the wait that was asked for', async () => {
+          playing(async (hook) => {
+            await hook.say();
+            await sleep(300);
+            await describing(hook);
+            await sleep(300);
+            await hook.reply((await hook.command())['id'], { ok: true, result: { fired: [] } });
+            await hook.say({ dialog: null, title: null });
+          });
+          const job = working.startScript({ script: 'Solver' });
+          // A script that was just started may be waited for as briefly as the caller likes.
+          await waitUntil(async () => (await json(join(home, 'jobs', job.id, 'dialog-state-1.json'))) !== null);
+          expect(kindOf(await working.scriptDialog({ waitMs: 0 }))).toBe('dialog');
+          expect(kindOf(await working.useScriptDialog({ action: 'close' }, { waitMs: 0 }))).toBe('done');
+        });
+
+        it('sends nothing for a call the client has given up on', async () => {
+          form();
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          const given = new AbortController();
+          given.abort();
+          expect(kindOf(await working.useScriptDialog({ action: 'press', field: 'f2' }, { ...look, signal: given.signal }))).toBe('none');
+          expect(await exists(job, 'dialog-cmd.json')).toBe(false);
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+
+        it.skipIf(process.platform === 'win32')('checks a path as the script gets it, where a backslash is part of a name and no separator', async () => {
+          const existing = join(home, 'existing.xisf');
+          await writeFile(existing, 'x');
+          playing(async (hook) => {
+            await hook.say({ dialog: null, title: null, question: { id: 1, kind: 'save_file', caption: 'Save' } });
+            await hook.answerTo(1);
+            await hook.say({ dialog: null, title: null });
+          });
+          const job = working.startScript({ script: 'Solver' });
+          await working.watchScript(job.id, look);
+          // Read with a slash for the backslash, this would name the existing file.
+          await expect(working.useScriptDialog({ action: 'answer', value: `${home}\\existing.xisf` }, look)).rejects.toMatchObject({ kind: 'invalid_path' });
+          await expect(working.useScriptDialog({ action: 'answer', value: 'C:\\out\\new.xisf' }, look)).rejects.toMatchObject({ kind: 'invalid_path' });
+          await expect(working.useScriptDialog({ action: 'answer', value: existing }, look)).rejects.toMatchObject({ kind: 'file_exists' });
+          expect(await exists(job, 'dialog-answer-1.json')).toBe(false);
+          await working.useScriptDialog({ action: 'close' }, look);
+        });
+      });
+
+      it.skipIf(process.platform === 'win32')('does not start a script whose path PixInsight would read as another one', async () => {
+        await feature(shipped, 'Back\\slash.js', 'Backslash : Utilities > Backslash');
+        const fresh = await Session.create(config({ scriptDialogs: 'operate' }), cli);
+        expect((await start({ script: 'Backslash' }, fresh)).error).toMatchObject({ kind: 'blocked_script' });
+        await fresh.close();
+      });
+
+      it('knows which job has a dialog that can be looked at', async () => {
+        form();
+        const job = working.startScript({ script: 'Solver' });
+        expect(working.dialogAccessOf(job.id)).toBe('operate');
+        expect(working.dialogAccessOf('another')).toBe('off');
+        await working.watchScript(job.id, look);
+        await working.useScriptDialog({ action: 'close' }, look);
+        let close: (() => void) | undefined;
+        cli.userScript = () => new Promise<void>((resolve) => (close = resolve));
+        const plain = working.startScript({ script: 'Solver', plain: true });
+        expect(working.dialogAccessOf(plain.id)).toBe('off');
+        await waitUntil(() => close !== undefined);
+        close?.();
+        await working.jobs.wait(plain.id, 2000);
+      });
+
+      it('only reads if the user has set it so: the script is told, and nothing can be done', async () => {
+        const reading = await Session.create(config({ scriptDialogs: 'read' }), cli);
+        const done = await start({ script: 'Solver' }, reading);
+        expect(await readFile(join(home, 'jobs', done.id, 'start.js'), 'utf8')).toContain(', false, false );\n#include');
+        // And the server sends nothing to a dialog, whoever asks.
+        const taken: Array<Record<string, any>> = [];
+        form(taken);
+        const job = reading.startScript({ script: 'Solver' });
+        expect(kindOf(await reading.watchScript(job.id, look))).toBe('dialog');
+        await expect(reading.useScriptDialog({ action: 'close' }, look)).rejects.toMatchObject({ kind: 'read_only' });
+        expect(taken.map((command) => command['act'])).toEqual(['describe']);
+        // The user closes the dialog.
+        await writeFile(join(home, 'jobs', job.id, 'dialog-cmd.json'), JSON.stringify({ act: 'close', dialog: 'd1.1', id: 99 }));
+        await reading.jobs.wait(job.id, 2000);
+        await reading.close();
+      });
     });
   });
 

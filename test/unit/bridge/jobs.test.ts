@@ -2,9 +2,9 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CliError, type InstanceInfo, type PixInsightCli } from '../../src/bridge/cli.js';
-import { JobManager, type JobManagerOptions, type JobTarget } from '../../src/bridge/jobs.js';
-import { sleep, waitUntil, writeResult } from './fakes.js';
+import { CliError, type InstanceInfo, type PixInsightCli } from '../../../src/bridge/cli.js';
+import { JobManager, type JobManagerOptions, type JobTarget } from '../../../src/bridge/jobs.js';
+import { sleep, waitUntil, writeResult } from '../fakes.js';
 
 type Behaviour = (jobDir: string, op: string) => Promise<void> | void;
 
@@ -43,6 +43,12 @@ class FakeCli implements PixInsightCli {
   }
 
   launch(): void {}
+
+  runToExit(): never {
+    throw new Error('Not part of this test');
+  }
+
+  endRun(): void {}
 
   async terminate(): Promise<void> {}
 
@@ -586,7 +592,7 @@ describe('JobManager', () => {
       expect((await jobs.wait(accepted.id, 2000)).state).toBe('succeeded');
     });
 
-    it.each(['ping', 'list_images', 'describe_process', 'image_stats', 'preview', 'open_image'])('lets %s through, which changes nothing that exists', async (op) => {
+    it.each(['ping', 'list_images', 'describe_process', 'image_stats', 'image_metadata', 'preview', 'open_image'])('lets %s through, which changes nothing that exists', async (op) => {
       const jobs = manager();
       const job = jobs.submit(op, {});
       target.generation = 1;
@@ -888,6 +894,84 @@ describe('JobManager', () => {
       expect(done).toMatchObject({ state: 'failed', error: { kind: 'cli_failed' } });
       expect(done.error?.message).toMatch(/script was started in PixInsight.*do not start it again/);
       expect(scripts()).toEqual(['/begin_log.js', SCRIPT, '/end_log.js']);
+    });
+
+    it('sends the file a check has it write in place of the script, and right after it the script that cleans up', async () => {
+      const jobs = manager();
+      const folders: string[] = [];
+      const job = jobs.submit('start_script', {}, {
+        validate: async () => ({
+          scriptAhead: {
+            path: SCRIPT,
+            wrap: async (jobDir) => {
+              folders.push(jobDir);
+              return join(jobDir, 'start.js');
+            },
+            then: '/unhook.js',
+          },
+        }),
+      });
+      expect(await jobs.wait(job.id, 2000)).toMatchObject({ state: 'succeeded' });
+      expect(folders).toEqual([join(jobsDir, job.id)]);
+      expect(scripts()).toEqual(['/begin_log.js', join(jobsDir, job.id, 'start.js'), '/unhook.js', '/runner.js']);
+    });
+
+    it('goes on if the script that cleans up cannot be sent, because what it would clean up cleans up after itself', async () => {
+      cli.failOn = { script: '/unhook.js', times: 1 };
+      const jobs = manager();
+      const job = jobs.submit('start_script', {}, { validate: async () => ({ scriptAhead: { path: SCRIPT, then: '/unhook.js' } }) });
+      expect(await jobs.wait(job.id, 2000)).toMatchObject({ state: 'succeeded' });
+      expect(scripts()).toEqual(['/begin_log.js', SCRIPT, '/runner.js']);
+    });
+
+    it('sends nothing but the end of the log if the file for the script cannot be written', async () => {
+      const jobs = manager();
+      const job = jobs.submit('start_script', {}, {
+        validate: async () => ({
+          scriptAhead: {
+            path: SCRIPT,
+            wrap: async () => {
+              throw new Error('disk full');
+            },
+            then: '/unhook.js',
+          },
+        }),
+      });
+      expect(await jobs.wait(job.id, 2000)).toMatchObject({ state: 'failed', error: { kind: 'internal_error', message: 'disk full' } });
+      expect(scripts()).toEqual(['/begin_log.js', '/end_log.js']);
+    });
+
+    it('does not send a script whose job was given up on while its file was being written', async () => {
+      const jobs = manager();
+      let written!: () => void;
+      let writing!: () => void;
+      const started = new Promise<void>((resolve) => (writing = resolve));
+      const job = jobs.submit('start_script', {}, {
+        validate: async () => ({
+          scriptAhead: {
+            path: SCRIPT,
+            wrap: async (jobDir) => {
+              writing();
+              await new Promise<void>((resolve) => (written = resolve));
+              return join(jobDir, 'start.js');
+            },
+            then: '/unhook.js',
+          },
+        }),
+      });
+      await started;
+      expect(await jobs.abandon(job.id)).toMatchObject({ stillRuns: false });
+      written();
+      await waitUntil(() => scripts().includes('/end_log.js'));
+      expect(scripts()).toEqual(['/begin_log.js', '/end_log.js']);
+    });
+
+    it('tells what runs inside the script on its behalf at once that the job is over', async () => {
+      const jobs = manager();
+      const job = jobs.submit('start_script', {}, ahead());
+      await jobs.wait(job.id, 2000);
+      // The file that says the server waits now says that it does not, without the wait for silence.
+      await waitUntil(async () => (await readFile(join(jobsDir, job.id, 'awaited'), 'utf8').catch(() => '')) === '0');
     });
 
     it('does not retry a job that has no script ahead of it', async () => {

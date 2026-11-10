@@ -39,8 +39,49 @@ describe('PJSR sources', () => {
 
   it('runs only on the V8 engine, and includes nothing of PixInsight', () => {
     for (const file of ['runner.js', 'ready.js', 'close_all.js', 'begin_log.js', 'end_log.js']) expect(read(file), file).toMatch(/^#engine v8$/m);
-    const sources = [...readdirSync(PJSR).filter((name) => name.endsWith('.js')), ...readdirSync(join(PJSR, 'ops')).map((name) => join('ops', name))];
+    const sources = [...readdirSync(PJSR).filter((name) => name.endsWith('.js')), ...['ops', 'dialogs'].flatMap((folder) => readdirSync(join(PJSR, folder)).map((name) => join(folder, name)))];
     for (const file of sources) expect(read(file), file).not.toMatch(/^\s*#include/m);
+    // Every file is either listed above as running on V8, the library of the runner, an operation, or one of the two that run with a script.
+    expect(readdirSync(PJSR).sort()).toEqual(['begin_log.js', 'close_all.js', 'dialogs', 'end_log.js', 'lib.js', 'ops', 'ready.js', 'runner.js']);
+    expect(readdirSync(join(PJSR, 'dialogs')).sort()).toEqual(['hook.js', 'unhook.js']);
+  });
+
+  // The files in dialogs/ are not for V8 alone: they run inside a script of the user, on the engine of that script.
+  describe('what runs with a script of the Script menu', () => {
+    const hook = read('dialogs/hook.js');
+    const code = hook.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+
+    it('is one function, which the server calls in a file that then includes the script', () => {
+      expect(() => new Script(`( ${hook} )( "/jobs/1", true, false );`)).not.toThrow();
+      expect(code.trimStart().startsWith('function( jobDir, operate, v8 )')).toBe(true);
+      // It is told its engine. The scope cannot say: on the older engine an earlier script can have left anything in it.
+      expect(code).not.toMatch(/typeof globalThis/);
+    });
+
+    it('has no line that the preprocessor of PixInsight would take for one of its own', () => {
+      expect(hook).not.toMatch(/^\s*#/m);
+      expect(read('dialogs/unhook.js')).not.toMatch(/^\s*#/m);
+    });
+
+    it('is written in the JavaScript of the older engine, which runs most scripts', () => {
+      for (const newer of [/=>/, /\b(const|let|class|async|await|of)\b/, /`/, /\.\.\./, /\?\?|\?\./]) expect(code, String(newer)).not.toMatch(newer);
+      // On V8, what only that engine has is used behind a check for it.
+      expect(hook.indexOf('new Proxy(')).toBeGreaterThan(hook.indexOf('if ( v8 )'));
+    });
+
+    it('reads no property that may be missing in a way the older engine warns about in the console', () => {
+      // A comparison with true, false or a value reads the property. Only typeof, in and a plain condition ask first.
+      expect(code).not.toMatch(/\b(command|error)\.\w+ (===|!==) (true|false|undefined)/);
+      expect(code).not.toMatch(/\b(classes|baseNames)\[[^\]]+\] (&&|===)/);
+    });
+
+    it('cleans up after the older engine with a script that says nothing about its engine, so that it runs there', () => {
+      const unhook = read('dialogs/unhook.js');
+      expect(unhook).not.toMatch(/#engine/);
+      expect(() => new Script(unhook)).not.toThrow();
+      expect(hook).toContain('root.__mcpUnhookDialogs = unhook;');
+      expect(unhook).toContain('__mcpUnhookDialogs();');
+    });
   });
 
   it('has an operation for every name the server sends', () => {

@@ -78,6 +78,13 @@ export interface ScriptAhead {
   path: string;
   /** The image to bring to the front right before the script, which works on the active image. */
   view?: string | undefined;
+  /**
+   * Writes a file into the folder of the job that is sent in place of the script and runs it from
+   * inside, and returns the path of that file.
+   */
+  wrap?: ((jobDir: string) => Promise<string>) | undefined;
+  /** A script to send right after, which runs whatever became of the one before it. */
+  then?: string | undefined;
 }
 
 /** What only the check of a job could find out. */
@@ -153,7 +160,7 @@ interface ImagesSeen {
  * Nothing here changes an image or a file, so these can go to a different instance than the one
  * the assistant has in mind. Anything else could hit an image there that only has the same name.
  */
-const SAFE_ON_ANY_INSTANCE = new Set(['ping', 'list_processes', 'describe_process', 'list_images', 'image_stats', 'preview', 'open_image', 'check_enum']);
+const SAFE_ON_ANY_INSTANCE = new Set(['ping', 'list_processes', 'describe_process', 'list_images', 'image_stats', 'image_metadata', 'preview', 'open_image', 'check_enum']);
 
 /** How often the server tells the runner that it still waits. The runner gives up after 15 s of silence. */
 const HEARTBEAT_MS = 1000;
@@ -195,7 +202,7 @@ async function readJson(path: string): Promise<unknown> {
 }
 
 /** The end of a text file, from the start of a line. Empty if the file is not there. */
-async function readEnd(path: string, maxBytes: number): Promise<string> {
+export async function readEnd(path: string, maxBytes: number): Promise<string> {
   const file = await open(path, 'r').catch(() => null);
   if (!file) return '';
   try {
@@ -212,7 +219,7 @@ async function readEnd(path: string, maxBytes: number): Promise<string> {
 }
 
 /** The start of a text file, up to its last whole line. Empty if the file is not there. */
-async function readStart(path: string, maxBytes: number): Promise<string> {
+export async function readStart(path: string, maxBytes: number): Promise<string> {
   const file = await open(path, 'r').catch(() => null);
   if (!file) return '';
   try {
@@ -231,7 +238,7 @@ function isJobResult(value: unknown): value is JobResult {
 }
 
 /** Console text without timestamps, color codes and the lines that only report progress. */
-function cleanLog(text: string): string[] {
+export function cleanLog(text: string): string[] {
   const lines = text
     .split(/\r?\n|\r/)
     .map((line) => line.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\[[^\]]*\]\s?/, '').trim())
@@ -585,13 +592,16 @@ export class JobManager {
     await cli.execute(slot, beginLogPath, [join(job.dir, SCRIPT_LOG), ...(script.view ? [script.view] : [])]);
     try {
       // Given up on in the meantime: the script must not start with nobody to report on it.
+      const path = script.wrap ? await script.wrap(job.dir) : script.path;
       if (!isDone(job.state)) {
-        await cli.execute(slot, script.path, []);
+        await cli.execute(slot, path, []);
         job.scriptSent = true;
+        // If this one does not arrive, what it would have put back puts itself back later.
+        if (script.then) await cli.execute(slot, script.then, []).catch(() => undefined);
       }
     } catch (error) {
       await cli.execute(slot, endLogPath, []).catch(() => undefined);
-      if (error instanceof CliError && error.code === 'cli_failed') {
+      if (error instanceof CliError && (error.code === 'cli_failed' || error.code === 'cli_timeout')) {
         throw new CliError(`${error.message} The script may have reached PixInsight all the same: if its dialog is open there, close it before you try again.`, error.code);
       }
       throw error;
@@ -730,6 +740,8 @@ export class JobManager {
     job.console = outcome.console;
     job.log = outcome.log;
     job.finishedAt = Date.now();
+    // What runs inside a script on behalf of this job learns at once that the job is over.
+    if (job.scriptSent) void this.beat(job);
     for (const listener of job.listeners.splice(0)) listener();
     this.finished.push(job);
     this.prune();

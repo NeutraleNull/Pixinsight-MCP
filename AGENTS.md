@@ -12,7 +12,7 @@ User documentation is the rest of `docs/`.
 - `npm run build`, `npm run typecheck`
 - `npm test`: unit tests, no PixInsight needed
 - `npm run guides:check`: checks the processing library and prints its catalog
-- `npm run test:live`: against a real, windowless PixInsight on slots 230 to 239; builds first. Set
+- `npm run test:live`: against a real, windowless PixInsight on slots 230 to 246; builds first. Set
   `PIXINSIGHT_TEST_SOLVED_IMAGE` to a plate-solved master to also test real metadata.
 - `node scripts/check-start.mjs`: starts the built server as a client would, without PixInsight
 - `node scripts/smoke.mjs`: as an MCP client against a running instance that the user can watch
@@ -39,8 +39,15 @@ CI (`.github/workflows/ci.yml`) runs everything that needs no PixInsight, on Lin
 
 ## Conventions
 
+- Code is grouped by what it is for, and `test/unit/` has the same folders as `src/`: `bridge` reaches
+  PixInsight, `scripts` is about the scripts of the Script menu and their dialogs, `preprocessing` about
+  runs of WBPP. A new file goes into the folder of its topic, and a new topic gets a folder once it has
+  more than one file. The list is in `docs/architecture.md`.
 - `pjsr/` runs inside PixInsight's V8: own code only, with a `#engine v8` directive on entry scripts and
-  no includes. Operations in `pjsr/ops/` are function bodies receiving `args` and `ctx`; report problems
+  no includes. The files in `pjsr/dialogs/` are the exception, because they run with a script of the
+  user on the engine of that script. Write them in the JavaScript of the classic engine, read no
+  property there that may be missing, and leave nothing behind in its scope.
+  Operations in `pjsr/ops/` are function bodies receiving `args` and `ctx`; report problems
   with `ctx.fail( kind, message )`.
 - All platform differences go into `src/platform.ts`, all executable calls into `src/bridge/cli.ts`.
 - stdout belongs to the MCP protocol: log to stderr only.

@@ -17,6 +17,42 @@ This article shows how to get reliable results from the tools: how to look at an
 
 Masters from WeightedBatchPreprocessing can contain extra images such as a crop mask. Only the first image is kept. To keep them all, set `allImages`.
 
+## Tell the assistant about your equipment
+
+Several steps depend on the camera, the telescope, and the filters: a flux calibration needs the bandwidth of a narrowband filter, and a color calibration the curves of the RGB filters. The assistant reads what a file says with [`get_image_metadata`](../reference/tools.md#get_image_metadata), and asks you for the rest before it starts.
+
+```json
+{ "view": "Ha", "search": "filt" }
+```
+
+A capture program often writes only the name of the filter slot, such as `H`. The make and the bandwidth are then nowhere in the file.
+
+To answer these questions once and for all, write your equipment down as a guide of your own:
+
+1. Create a folder for your guides, with a folder `practices` in it.
+2. Save a file `equipment.md` there. The ID `practices/equipment` makes it take the place of the guide that tells the assistant to ask:
+
+   ```markdown
+   ---
+   title: The equipment of this user
+   summary: Camera, telescope and filters of this user. Read this first, and ask only for what it does not say.
+   ---
+
+   - Camera: mono, 3.76 µm pixels, cooled to -10 °C, gain 100, offset 50.
+   - Telescope: 80 mm refractor, 480 mm focal length.
+   - Narrowband filters: Hα, OIII and SII with 3 nm bandwidth.
+   - Broadband filters: L, R, G and B.
+   - Frames are dithered every third exposure. Flats are taken with a panel after each night.
+
+   Ask for whatever a step needs and this list does not say.
+   ```
+
+   Add the maker and the series of each set of filters: a color calibration looks up their curves by that name.
+
+3. Name the folder in [`PIXINSIGHT_MCP_GUIDE_DIRS`](../reference/configuration.md), and restart your assistant. Later changes to the file apply at once.
+
+The format of the file is in the [processing library reference](../reference/processing-library.md).
+
 ## Look at an image
 
 [`get_preview`](../reference/tools.md#get_preview) returns a JPEG and leaves the image, its history, and its display in PixInsight untouched.

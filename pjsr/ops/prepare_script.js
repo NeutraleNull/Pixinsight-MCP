@@ -9,4 +9,17 @@ if ( args.view )
    if ( ctx.activeView() != view.id )
       ctx.fail( "not_active", "PixInsight did not make " + view.id + " the active image, so the script would work on another one." );
 }
+if ( args.script )
+{
+   // PixInsight refuses to run a signed script that was changed after it was signed. The server
+   // starts a script from inside a file of its own, where PixInsight does not look at the
+   // signature of the script, so the same check is made here.
+   const signed = File.exists( File.changeExtension( args.script, ".xsgn" ) );
+   if ( signed )
+   {
+      const signature = Security.getScriptSignature( args.script );
+      if ( !signature || signature.valid !== true )
+         ctx.fail( "bad_signature", "The signature of this script is not valid for its file: the file was changed after it was signed, or the signature is damaged. PixInsight would not run it either." );
+   }
+}
 return { startedOn: ctx.activeView(), images: ctx.imageDetails() };

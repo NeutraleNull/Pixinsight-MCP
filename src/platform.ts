@@ -72,15 +72,24 @@ export function splitPathList(value: string | undefined, platform: NodeJS.Platfo
 }
 
 /**
- * `-x=<slot>:<script>,<arg>` separates arguments with commas, and the Linux launcher
- * re-evaluates its command line with `eval`, so these characters would change its meaning. It
- * puts an argument with a space into double quotes, which is why a space is fine and a tab is not.
+ * The first character of a value that cannot go onto the command line of PixInsight, or null.
+ *
+ * `-x=<slot>:<script>,<arg>` separates arguments with commas, and the launcher that PixInsight
+ * comes with elsewhere than on Windows re-evaluates its command line with `eval`, so these
+ * characters would change its meaning. It puts an argument with a space into double quotes, which
+ * is why a space is fine and a tab is not, and it takes a backslash away unless the argument has
+ * a space. No command line holds a control character.
  */
-export function assertSafeForIpc(value: string): void {
-  const bad = /[,"'`$;&|<>()*?[\]{}\t\n\r]/.exec(value);
-  if (bad) {
+export function unsafeForIpc(value: string, platform: NodeJS.Platform = process.platform): string | null {
+  const bad = /[,"'`$;&|<>()*?[\]{}\u0000-\u001f\u007f]/.exec(value)?.[0];
+  return bad ?? (platform !== 'win32' && value.includes('\\') ? '\\' : null);
+}
+
+export function assertSafeForIpc(value: string, platform: NodeJS.Platform = process.platform): void {
+  const bad = unsafeForIpc(value, platform);
+  if (bad !== null) {
     throw new Error(
-      `Path cannot be passed over PixInsight's command line because it contains ${JSON.stringify(bad[0])}: ${value}. ` +
+      `Path cannot be passed over PixInsight's command line because it contains ${JSON.stringify(bad)}: ${value}. ` +
         'Set PIXINSIGHT_MCP_HOME to a plain directory.',
     );
   }

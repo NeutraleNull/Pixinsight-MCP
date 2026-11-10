@@ -8,7 +8,7 @@ import { ManagedInstance } from '../../src/bridge/instance.js';
 import type { Config } from '../../src/config.js';
 import { prepareHome } from '../../src/home.js';
 import { Session } from '../../src/session.js';
-import { EXECUTABLE, removeFilesOfSlots, removeSwapFilesSince, slotsOf, WORKER_SLOT } from './harness.js';
+import { EXECUTABLE, PREPROCESS_SLOT, removeFilesOfSlots, removeSwapFilesSince, slotsOf, WORKER_SLOT } from './harness.js';
 
 // Stands in for the instance a user runs. The slot is always set explicitly here, because
 // otherwise this test would attach to whatever PixInsight the developer has open.
@@ -28,10 +28,11 @@ describe.skipIf(!existsSync(EXECUTABLE))('shared mode', { timeout: 120_000 }, ()
     slot: USER_SLOT,
     workerSlot: WORKER_SLOT,
     shadowSlot: SHADOW_SLOT,
+    preprocessSlot: PREPROCESS_SLOT,
     headless: true,
     home,
     allowedPrograms: [],
-    guideDirs: [], scriptDirs: [], allowCode: false,
+    guideDirs: [], scriptDirs: [], allowCode: false, scriptDialogs: 'operate',
     ...overrides,
   });
 

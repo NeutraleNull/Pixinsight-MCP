@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { findScripts, hashOfFile, parseFeature, similarNames } from '../../src/scripts.js';
+import { findScripts, hashOfFile, parseFeature, similarNames } from '../../../src/scripts/catalog.js';
 
 describe('parseFeature', () => {
   it('reads a name with its menu', () => {

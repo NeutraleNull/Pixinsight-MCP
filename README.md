@@ -48,7 +48,7 @@ Assistant:
 - **Look and measure.** The assistant sees your images as previews and reads their statistics, so it judges by numbers as well as by eye.
 - **Run any installed process,** including third-party ones such as BlurXTerminator, StarXTerminator, and GraXpert. New versions and modules work without an update to this server.
 - **Follow tried workflows.** A processing library of small guides from real runs tells the assistant how to remove gradients, sharpen, stretch, build a narrowband palette, and check each step.
-- **Start scripts** such as ImageSolver for you. You set the dialog, the assistant reads the result.
+- **Run scripts** such as ImageSolver for you. The assistant reads the dialog of a script and what the script shows in it. If you turn it on, it also sets the dialog and presses its buttons, on your screen and without taking over your mouse.
 - **Work with any model.** The server speaks MCP, so it works with Claude, GPT, Gemini, and others.
 
 ## Documentation
@@ -59,7 +59,8 @@ Assistant:
 | [Connect an assistant](docs/guides/connect-an-assistant.md) | Use the server with Claude, GPT, Gemini, or another model |
 | [How the server works](docs/concepts.md) | Understand instances, jobs, and what keeps your work safe |
 | [Process an image](docs/guides/process-an-image.md) | Look, measure, try settings, mask, save, and export |
-| [Run scripts and code](docs/guides/run-scripts-and-code.md) | Let the assistant start scripts such as ImageSolver, and decide whether it may run its own code |
+| [Preprocess raw frames](docs/guides/preprocess-raw-frames.md) | Let the assistant calibrate, register, and integrate your frames with WBPP, without its dialog |
+| [Run scripts and code](docs/guides/run-scripts-and-code.md) | Let the assistant start scripts such as ImageSolver and work their dialogs, and decide whether it may run its own code |
 | [Handle dialogs, long jobs, and crashes](docs/guides/dialogs-jobs-crashes.md) | Know what to do when something does not go as planned |
 | [Add a processing method](docs/guides/add-a-processing-method.md) | Teach the assistant a technique of your own, with one Markdown file |
 | [Tool reference](docs/reference/tools.md) | Look up every tool, its parameters, and its response |

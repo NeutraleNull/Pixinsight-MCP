@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { parseEnumerate } from '../../src/bridge/cli.js';
-import { loadConfig, shadowSlots } from '../../src/config.js';
+import { loadConfig, preprocessSlots, shadowSlots } from '../../src/config.js';
 import {
   assertSafeForIpc,
+  unsafeForIpc,
   defaultExecutable,
   defaultHome,
   parseProcStatCpuSeconds,
@@ -28,6 +29,22 @@ describe('platform defaults', () => {
 
   it('converts Windows paths for PJSR', () => {
     expect(toPixPath('C:\\Users\\a\\job')).toBe('C:/Users/a/job');
+  });
+});
+
+describe('unsafeForIpc', () => {
+  it('names the character that cannot go onto a command line, and passes what can', () => {
+    expect(unsafeForIpc('/data/my frames/night_1/light-001.fits', 'linux')).toBeNull();
+    for (const bad of [',', '"', "'", '`', '$', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', ']', '{', '}', '\t', '\n', '\r', '\u0000', '\u007f']) {
+      expect(unsafeForIpc(`/data/a${bad}b`, 'linux'), JSON.stringify(bad)).toBe(bad);
+    }
+  });
+
+  it('refuses a backslash where the launcher of PixInsight would take it away, and not on Windows', () => {
+    expect(unsafeForIpc('/data/a\\b', 'linux')).toBe('\\');
+    expect(unsafeForIpc('/data/a\\b', 'darwin')).toBe('\\');
+    expect(unsafeForIpc('C:\\data\\a b', 'win32')).toBeNull();
+    expect(() => assertSafeForIpc('/data/a\\b', 'linux')).toThrow(/contains "\\\\"/);
   });
 });
 
@@ -140,6 +157,14 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ PIXINSIGHT_MCP_ALLOW_CODE: 'maybe' }, 'linux')).toThrow(/PIXINSIGHT_MCP_ALLOW_CODE/);
   });
 
+  it('lets the assistant read the dialogs of scripts, and work them only if the user says so', () => {
+    expect(loadConfig({}, 'linux').scriptDialogs).toBe('read');
+    expect(loadConfig({ PIXINSIGHT_MCP_SCRIPT_DIALOGS: '' }, 'linux').scriptDialogs).toBe('read');
+    expect(loadConfig({ PIXINSIGHT_MCP_SCRIPT_DIALOGS: 'operate' }, 'linux').scriptDialogs).toBe('operate');
+    expect(loadConfig({ PIXINSIGHT_MCP_SCRIPT_DIALOGS: 'off' }, 'linux').scriptDialogs).toBe('off');
+    expect(() => loadConfig({ PIXINSIGHT_MCP_SCRIPT_DIALOGS: '1' }, 'linux')).toThrow(/PIXINSIGHT_MCP_SCRIPT_DIALOGS must be "operate", "read" or "off"/);
+  });
+
   it('rejects bad values', () => {
     expect(() => loadConfig({ PIXINSIGHT_MCP_MODE: 'nope' }, 'linux')).toThrow(/PIXINSIGHT_MCP_MODE/);
     expect(() => loadConfig({ PIXINSIGHT_SLOT: '999' }, 'linux')).toThrow(/PIXINSIGHT_SLOT/);
@@ -151,7 +176,18 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ PIXINSIGHT_MCP_MODE: 'worker', PIXINSIGHT_MCP_WORKER_SLOT: '250' }, 'linux')).toThrow(/reserved for shadow/);
     expect(() => loadConfig({ PIXINSIGHT_SLOT: '5', PIXINSIGHT_MCP_SHADOW_SLOT: '3' }, 'linux')).toThrow(/slots 3 to 9/);
     expect(loadConfig({ PIXINSIGHT_SLOT: '249' }, 'linux').slot).toBe(249);
-    expect(loadConfig({ PIXINSIGHT_SLOT: '250', PIXINSIGHT_MCP_SHADOW_SLOT: '240' }, 'linux').slot).toBe(250);
+    expect(loadConfig({ PIXINSIGHT_SLOT: '250', PIXINSIGHT_MCP_SHADOW_SLOT: '230' }, 'linux').slot).toBe(250);
+  });
+
+  it('keeps the slots of preprocessing runs to themselves, because a run that is cancelled ends its instance', () => {
+    expect(preprocessSlots(loadConfig({}, 'linux'))).toEqual([240, 241, 242]);
+    expect(preprocessSlots({ preprocessSlot: 255 })).toEqual([255, 256]);
+    expect(() => loadConfig({ PIXINSIGHT_SLOT: '241' }, 'linux')).toThrow(/Slot 241 is one of the slots 240 to 242 for preprocessing runs.*PIXINSIGHT_MCP_PREPROCESS_SLOT/);
+    expect(() => loadConfig({ PIXINSIGHT_MCP_SHADOW_SLOT: '236' }, 'linux')).toThrow(/preprocessing runs/);
+    expect(() => loadConfig({ PIXINSIGHT_MCP_MODE: 'worker', PIXINSIGHT_MCP_WORKER_SLOT: '242' }, 'linux')).toThrow(/preprocessing runs/);
+    expect(() => loadConfig({ PIXINSIGHT_MCP_PREPROCESS_SLOT: '199' }, 'linux')).toThrow(/Slot 200/);
+    expect(() => loadConfig({ PIXINSIGHT_MCP_PREPROCESS_SLOT: '0' }, 'linux')).toThrow(/PIXINSIGHT_MCP_PREPROCESS_SLOT must be an instance slot/);
+    expect(loadConfig({ PIXINSIGHT_SLOT: '241', PIXINSIGHT_MCP_PREPROCESS_SLOT: '210' }, 'linux').preprocessSlot).toBe(210);
   });
 
   it('reserves slots for shadow instances only up to the last slot', () => {

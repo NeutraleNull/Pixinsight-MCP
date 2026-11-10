@@ -21,13 +21,14 @@ Nothing keeps running inside PixInsight between jobs. You can keep working in Pi
 
 ## Instances
 
-PixInsight can run several times at once, and each running copy is an **instance** on a numbered **slot**. The server deals with up to three kinds:
+PixInsight can run several times at once, and each running copy is an **instance** on a numbered **slot**. The server deals with up to four kinds:
 
 | Instance | Slot | Purpose | Visible |
 |---|---|---|---|
 | Yours | Usually 1 | Where the work happens in shared mode | Yes |
 | Worker | 200 | Replaces yours in worker mode, for unattended work | No, on Linux |
 | Shadow | 250 to 256 | Tries risky settings before they reach your instance | No, on Linux |
+| Preprocessing | 240 to 242 | Runs WBPP over raw frames, and ends with the run | No, on Linux |
 
 The server stays with the instance it first attached to. If that instance goes away, the server says so instead of moving on quietly. It never treats a worker or shadow instance as yours. See [After a crash](guides/dialogs-jobs-crashes.md#after-a-crash).
 
@@ -76,7 +77,7 @@ A few processes are blocked, because an assistant should not run them unasked:
 | `NetworkService` | Acts on tasks from a network service |
 | Everything in the `Instrumentation` category | Controls physical equipment such as cameras and mounts |
 
-Scripts of the Script menu are a case of their own. PixInsight cannot run them with settings from outside, so the assistant starts a script and you work its dialog. A script without a dialog acts at once. Code that the assistant writes itself only runs if you turn that on. See [Run scripts and code](guides/run-scripts-and-code.md).
+Scripts of the Script menu are a case of their own. PixInsight cannot run them with settings from outside, so the assistant starts a script and reads its dialog: the fields, their values, and what the script shows there. You set the dialog and press its buttons. If you turn that on, the assistant does this too, the way you would, on your screen. A script without a dialog acts at once. Code that the assistant writes itself only runs if you turn that on. See [Run scripts and code](guides/run-scripts-and-code.md).
 
 Two kinds of settings need your agreement:
 
@@ -99,6 +100,10 @@ Two kinds of settings need your agreement:
 | The assistant works on the wrong instance | A change of instance is always announced. Jobs that change an image or a file are refused until then |
 | A script or code changes images | The response lists the images that are new, closed, or changed. What a script or code does to files or settings is not shown |
 | The assistant runs code of its own | It cannot, unless you have turned that on. Scripts for equipment and for developers are blocked |
+| The assistant reads or enters a password in a dialog of a script | It cannot: a field that hides what is typed is never read out, is painted over in pictures, and is never filled in. A key in an ordinary text field is not recognized |
+| A script replaces a file because the assistant named it | The server hands an existing file to a script that asks where to write only if the request says that you agreed. What a script does with other settings of its dialog is not checked: see [Let the assistant work the dialog](guides/run-scripts-and-code.md#let-the-assistant-work-the-dialog) |
+| The assistant acts on a dialog that has changed since it read it | An action applies to the dialog or question that the assistant was last shown, and is refused if the script shows another one by now |
+| A signed script was changed after it was signed | The server asks PixInsight to check the signature before it starts the script, and starts nothing if it does not match |
 | The assistant writes a script file and starts it | A script in a folder of yours counts as it was when the server started. A changed or added one is refused until you restart the server |
 | A file of the server is changed to run code in PixInsight | Before each job, the server checks that its scripts are the ones it came with, and puts them back if not |
 | A server stops an instance that is not its own | A server only stops what it started itself, after checking that it is still that instance |
@@ -108,7 +113,7 @@ Two kinds of settings need your agreement:
 
 ## What stays on your computer
 
-The server talks to your client over standard input and output, and opens no network port. Job files stay in a [folder on your computer](reference/configuration.md#files-the-server-creates). Previews and statistics do go to your MCP client, and from there to the AI model it uses, so they leave your computer if that model runs in the cloud. The same holds for what the tools report besides: names of images and files, paths on your computer, which include your user name, and what processes and scripts write to the console.
+The server talks to your client over standard input and output, and opens no network port. Job files stay in a [folder on your computer](reference/configuration.md#files-the-server-creates). Previews and statistics do go to your MCP client, and from there to the AI model it uses, so they leave your computer if that model runs in the cloud. The same holds for what the tools report besides: names of images and files, paths on your computer, which include your user name, what processes and scripts write to the console, and what the dialog of a script shows: its fields with their values, its tooltips, its questions, and pictures of it. The content of a field that hides what is typed is the exception.
 
 ## Next steps
 
